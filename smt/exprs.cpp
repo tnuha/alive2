@@ -4,6 +4,7 @@
 #include "smt/exprs.h"
 #include "smt/smt.h"
 #include "util/compiler.h"
+#include <algorithm>
 #include <vector>
 
 using namespace std;
@@ -43,6 +44,12 @@ void AndExpr::add(const AndExpr &other) {
 void AndExpr::del(const AndExpr &other) {
   for (auto &e : other.exprs)
     exprs.erase(e);
+}
+
+expr AndExpr::propagate(const AndExpr &other) const {
+  vector<expr> ret;
+  ranges::set_difference(exprs, other.exprs, back_inserter(ret), less{});
+  return expr::mk_and(ret).propagate(other);
 }
 
 void AndExpr::reset() {
@@ -184,6 +191,59 @@ DisjointExpr<expr>::DisjointExpr(const expr &e, unsigned depth_limit) {
   } while (!worklist.empty());
 }
 
+// factor the common terms out
+template<> AndExpr DisjointExpr<AndExpr>::factor() const {
+  assert(!vals.empty());
+  if (vals.size() == 1)
+    return vals.begin()->first;
+
+  AndExpr ret;
+  vector<pair<AndExpr, expr>> vals2;
+  vals2.insert(vals2.end(), vals.begin(), vals.end());
+
+  vector<pair<set<expr>::iterator, set<expr>::iterator>> its;
+  its.reserve(vals2.size());
+  for (auto &v : vals2) {
+    its.emplace_back(v.first.exprs.begin(), v.first.exprs.end());
+  }
+
+  auto &it0 = its[0].first;
+  while (it0 != its[0].second) {
+    const expr &e0 = *it0;
+    bool in_all = true;
+    for (unsigned i = 1, e = its.size(); i != e; ++i) {
+      auto &it2 = its[i].first;
+      if (it2 == its[i].second) {
+        goto end;
+      }
+      auto cmp = *it2 <=> e0;
+      if (cmp < 0) {
+        ++it2;
+        --i; // repeate this AndExpr
+      } else if (cmp > 0) {
+        ++it0;
+        in_all = false;
+        break;
+      }
+    }
+    if (in_all) {
+      ret.add(e0);
+      unsigned i = 0;
+      for (auto &v : vals2) {
+        auto &it = its[i++].first;
+        it = v.first.exprs.erase(it);
+      }
+    }
+  }
+end:
+  DisjointExpr<expr> leftovers;
+  for (auto &[v, domain] : vals2) {
+    leftovers.add(std::move(v)(), std::move(domain));
+  }
+  ret.add(*std::move(leftovers)());
+  return ret;
+}
+
 
 void FunctionExpr::add(const expr &key, expr &&val) {
   ENSURE(fn.emplace(key, std::move(val)).second);
@@ -191,6 +251,10 @@ void FunctionExpr::add(const expr &key, expr &&val) {
 
 void FunctionExpr::add(const FunctionExpr &other) {
   fn.insert(other.fn.begin(), other.fn.end());
+}
+
+void FunctionExpr::replace(const expr &key, expr &&val) {
+  fn.insert_or_assign(key, std::move(val));
 }
 
 optional<expr> FunctionExpr::operator()(const expr &key) const {
@@ -212,6 +276,19 @@ FunctionExpr FunctionExpr::simplify() const {
     newfn.add(k.simplify(), v.simplify());
   }
   return newfn;
+}
+
+FunctionExpr FunctionExpr::mkIf(const expr &cond, const FunctionExpr &then,
+                                const FunctionExpr &els) {
+  FunctionExpr ret;
+  auto I = els.begin();
+  for (auto &[k, v] : then) {
+    assert(I != els.end());
+    auto [k2, v2] = *I++;
+    assert(k.eq(k2));
+    ret.add(k, expr::mkIf(cond, v, v2));
+  }
+  return ret;
 }
 
 ostream& operator<<(ostream &os, const FunctionExpr &f) {

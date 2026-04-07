@@ -5,6 +5,7 @@
 #include "ir/function.h"
 #include "ir/globals.h"
 #include "smt/smt.h"
+#include "smt/solver.h"
 #include "util/config.h"
 #include "util/errors.h"
 #include <algorithm>
@@ -21,7 +22,7 @@ static void throw_oom_exception() {
 namespace IR {
 
 SMTMemoryAccess::SMTMemoryAccess(const MemoryAccess &val)
-  : val(expr::mkUInt(val.val, 2 * AccessType::NumTypes)) {}
+    : val(expr::mkUInt(val.val, 2 * AccessType::NumTypes)) {}
 
 // format ..rw..
 expr SMTMemoryAccess::canAccess(AccessType ty) const {
@@ -75,13 +76,10 @@ expr SMTMemoryAccess::refinedBy(const SMTMemoryAccess &other) const {
   return (val & other.val) == val;
 }
 
-SMTMemoryAccess
-SMTMemoryAccess::SMTMemoryAccess::mkIf(const expr &cond,
-                                       const SMTMemoryAccess &then,
-                                       const SMTMemoryAccess &els) {
+SMTMemoryAccess SMTMemoryAccess::SMTMemoryAccess::mkIf(
+    const expr &cond, const SMTMemoryAccess &then, const SMTMemoryAccess &els) {
   return expr::mkIf(cond, then.val, els.val);
 }
-
 
 expr State::CurrentDomain::operator()() const {
   return path && UB();
@@ -91,11 +89,9 @@ State::CurrentDomain::operator bool() const {
   return !path.isFalse() && UB;
 }
 
-template<class T>
-static T intersect_set(const T &a, const T &b) {
+template <class T> static T intersect_set(const T &a, const T &b) {
   T results;
-  set_intersection(a.begin(), a.end(), b.begin(), b.end(),
-                   inserter(results, results.begin()));
+  ranges::set_intersection(a, b, inserter(results, results.begin()), less{});
   return results;
 }
 
@@ -103,53 +99,41 @@ void State::ValueAnalysis::meet_with(const State::ValueAnalysis &other) {
   non_poison_vals = intersect_set(non_poison_vals, other.non_poison_vals);
   non_undef_vals = intersect_set(non_undef_vals, other.non_undef_vals);
   unused_vars = intersect_set(unused_vars, other.unused_vars);
+  ranges_fn_calls.meet_with(other.ranges_fn_calls);
+}
 
-  for (auto &[fn, pair] : other.ranges_fn_calls) {
-    auto &[calls, access] = pair;
-    auto [I, inserted] = ranges_fn_calls.try_emplace(fn, pair);
-    if (inserted) {
-      I->second.first.emplace(0);
-    } else {
-      I->second.first.insert(calls.begin(), calls.end());
-      I->second.second |= access;
-    }
-  }
-
-  for (auto &[fn, pair] : ranges_fn_calls) {
-    auto &[calls, access] = pair;
-    if (!other.ranges_fn_calls.count(fn))
-      calls.emplace(0);
-  }
+void State::ValueAnalysis::clear_smt() {
+  non_poison_vals.clear();
+  non_undef_vals = decltype(non_undef_vals)();
+  unused_vars = decltype(unused_vars)();
 }
 
 void State::ValueAnalysis::FnCallRanges::inc(const string &name,
                                              const SMTMemoryAccess &access) {
-  if (access.canWriteSomething().isFalse())
-    return;
+  bool canwrite = !access.canWriteSomething().isFalse();
 
   auto [I, inserted] = try_emplace(name);
   if (inserted) {
-    I->second.first.emplace(1);
+    I->second.first.emplace(1, canwrite);
     I->second.second = access;
   } else {
-    set<unsigned> new_set;
-    for (unsigned n : I->second.first) {
-      new_set.emplace(n+1);
+    set<pair<unsigned, bool>> new_set;
+    for (auto [n, writes0] : I->second.first) {
+      new_set.emplace(n + 1, writes0 | canwrite);
     }
-    I->second.first   = std::move(new_set);
+    I->second.first = std::move(new_set);
     I->second.second |= access;
   }
 }
 
-bool
-State::ValueAnalysis::FnCallRanges::overlaps(const string &callee,
-                                             const SMTMemoryAccess &call_access,
-                                             const FnCallRanges &other) const {
+bool State::ValueAnalysis::FnCallRanges::overlaps(
+    const string &callee, const SMTMemoryAccess &call_access,
+    const FnCallRanges &other) const {
   if (call_access.canReadSomething().isFalse())
     return true;
 
-  auto skip
-    = [call_access, &callee](const auto &fn, const SMTMemoryAccess &access) {
+  auto skip = [call_access, &callee](const auto &fn,
+                                     const SMTMemoryAccess &access) {
     if (access.canOnlyWrite(MemoryAccess::Inaccessible).isTrue()) {
       // If this fn can only write to inaccessible memory, ignore if it's not
       // our callee as callee can't read from that memory
@@ -178,14 +162,13 @@ State::ValueAnalysis::FnCallRanges::overlaps(const string &callee,
 
   for (auto &[fn, pair] : *this) {
     auto &[calls, access] = pair;
-    assert(!access.canWriteSomething().isFalse());
 
     if (skip(fn, access))
       continue;
 
     auto I = other.find(fn);
     if (I == other.end()) {
-      if (calls.count(0))
+      if (calls.count({0, true}))
         continue;
       return false;
     }
@@ -195,7 +178,10 @@ State::ValueAnalysis::FnCallRanges::overlaps(const string &callee,
     if ((access | I->second.second).canReadSomething().isFalse())
       continue;
 
-    if (intersect_set(calls, I->second.first).empty())
+    auto set = intersect_set(calls, I->second.first);
+    // must only have write accesses
+    assert(ranges::all_of(set, [](auto &p) { return p.second; }));
+    if (set.empty())
       return false;
   }
 
@@ -204,10 +190,31 @@ State::ValueAnalysis::FnCallRanges::overlaps(const string &callee,
     if (skip(fn, access))
       continue;
 
-    if (!calls.count(0) && !count(fn))
+    if (!calls.count({0, true}) && !count(fn))
       return false;
   }
 
+  return true;
+}
+
+bool State::ValueAnalysis::FnCallRanges::isLargerThanInclReads(
+    const FnCallRanges &other) const {
+  for (auto &[fn, pair] : *this) {
+    auto &[calls, access] = pair;
+    auto I = other.find(fn);
+    if (I == other.end())
+      continue;
+
+    auto first_val = calls.begin()->first;
+    auto other_last_val = I->second.first.rbegin()->first;
+    if (first_val < other_last_val)
+      return false;
+  }
+
+  for (auto &[fn, pair] : other) {
+    if (!count(fn))
+      return false;
+  }
   return true;
 }
 
@@ -221,9 +228,44 @@ State::ValueAnalysis::FnCallRanges::project(const string &name) const {
   return ranges;
 }
 
-State::VarArgsData
-State::VarArgsData::mkIf(const expr &cond, VarArgsData &&then,
-                         VarArgsData &&els) {
+void State::ValueAnalysis::FnCallRanges::keep_only_writes() {
+  for (auto I = begin(); I != end();) {
+    auto &[calls, access] = I->second;
+    for (auto II = calls.begin(); II != calls.end();) {
+      if (!II->second)
+        II = calls.erase(II);
+      else
+        ++II;
+    }
+    if (calls.empty())
+      I = erase(I);
+    else
+      ++I;
+  }
+}
+
+void State::ValueAnalysis::FnCallRanges::meet_with(const FnCallRanges &other) {
+  for (auto &[fn, pair] : other) {
+    auto &[calls, access] = pair;
+    auto [I, inserted] = try_emplace(fn, pair);
+    if (inserted) {
+      I->second.first.emplace(0, true);
+    } else {
+      I->second.first.insert(calls.begin(), calls.end());
+      I->second.second |= access;
+    }
+  }
+
+  for (auto &[fn, pair] : *this) {
+    auto &[calls, access] = pair;
+    if (!other.count(fn))
+      calls.emplace(0, true);
+  }
+}
+
+State::VarArgsData State::VarArgsData::mkIf(const expr &cond,
+                                            VarArgsData &&then,
+                                            VarArgsData &&els) {
   VarArgsData ret;
   for (auto &[ptr, entry] : then.data) {
     auto other = els.data.find(ptr);
@@ -252,10 +294,10 @@ State::VarArgsData::mkIf(const expr &cond, VarArgsData &&then,
 }
 
 State::State(const Function &f, bool source)
-  : f(f), source(source), memory(*this),
-    fp_rounding_mode(expr::mkVar("fp_rounding_mode", 3)),
-    fp_denormal_mode(expr::mkVar("fp_denormal_mode", 2)),
-    return_val(DisjointExpr(f.getType().getDummyValue(false))) {
+    : f(f), source(source), memory(*this),
+      fp_rounding_mode(expr::mkVar("fp_rounding_mode", 3)),
+      fp_denormal_mode(expr::mkVar("fp_denormal_mode", 2)),
+      return_val(DisjointExpr(f.getType().getDummyValue(false))) {
 
   if (get_uf_float())
     doesApproximation("uf-float");
@@ -265,20 +307,29 @@ void State::resetGlobals() {
   Memory::resetGlobals();
 }
 
-const State::ValTy& State::exec(const Value &v) {
+const State::ValTy &State::exec(const Value &v) {
   assert(undef_vars.empty());
   domain.noreturn = true;
   auto val = v.toSMT(*this);
 
-  auto value_ub = domain.UB();
+  auto value_ub = domain.UB;
   if (config::disallow_ub_exploitation)
-    value_ub &= !guardable_ub();
+    value_ub.add(!guardable_ub());
 
-  auto [I, inserted]
-    = values.try_emplace(&v, ValTy{std::move(val), domain.noreturn,
+  auto [I, inserted] =
+      values.try_emplace(&v, ValTy{std::move(val), domain.noreturn,
                                    std::move(value_ub), std::move(undef_vars)});
   assert(inserted);
-  analysis.unused_vars.insert(&v);
+
+  // As an optimization, record that this value has not yet been used, so
+  // we can use this undef variable (if any) on the first use
+  // This saves one rewrite per definition
+  // We cannot do this optimization in ASM mode because an undef value may
+  // trigger a poison value in the source, but since the target does not have
+  // poison values, it must be converted into a non-det value that must be
+  // able to range over the full domain, not just the non-poison domain.
+  if (!config::tgt_is_asm)
+    analysis.unused_vars.insert(&v);
 
   // cleanup potentially used temporary values due to undef rewriting
   while (i_tmp_values > 0) {
@@ -313,200 +364,120 @@ static expr eq_except_padding(const Memory &m, const Type &ty, const expr &e1,
 
 expr State::strip_undef_and_add_ub(const Value &val, const expr &e,
                                    bool ptr_compare) {
+  if (undef_vars.empty() || e.isConst())
+    return e;
+
   if (isUndef(e)) {
     addUB(expr(false));
-    return expr::mkUInt(0, e);
+    return expr::mkNumber("0", e);
   }
 
-  auto is_undef_cond = [](const expr &e, const expr &var) {
-    expr lhs, rhs;
-    // (= #b0 isundef_%var)
-    if (e.isEq(lhs, rhs)) {
-      return (lhs.isZero() && Input::isUndefMask(rhs, var)) ||
-             (rhs.isZero() && Input::isUndefMask(lhs, var));
-    }
-    return false;
-  };
+  auto vars = e.vars();
+  auto undef_vars = intersect_set(vars, this->undef_vars);
+  if (undef_vars.empty())
+    return e;
 
-  // pointer undef vars show up like (concat 0 undef)
-  auto is_undef_or_concat = [&](const expr &e) {
-    if (isUndef(e))
-      return true;
+  // check if any var is already known to be non-undef
+  vector<pair<expr, expr>> repls;
+  set<expr> missing_tests;
+  expr conds = true;
+  bool has_undef = false;
 
-    expr a, b;
-    return e.isConcat(a, b) && a.isZero() && isUndef(b);
-  };
-
-  auto is_if_undef = [&](const expr &e, expr &var, expr &not_undef) {
-    expr undef;
-    // (ite (= #b0 isundef_%var) %var undef)
-    return e.isIf(not_undef, var, undef) &&
-           is_undef_or_concat(undef) &&
-           is_undef_cond(not_undef, var);
-  };
-
-  // e2: stripped expression
-  auto is_if_undef_or_add = [&](const expr &e, expr &var, expr &not_undef,
-                                expr &e2) {
-    // when e = (ite (= #b0 isundef_%var) %var undef):
-    //   var = %var, e2 = %var
-    // when e = (bvadd const (ite (= #b0 isundef_%var) %var undef))
-    //   var = %var, e2 = const + %var
-    if (is_if_undef(e, var, not_undef)) {
-      e2 = var;
-      return true;
-    }
-
-    expr a, b;
-    if (e.isAdd(a, b)) {
-      if (b.isConst() && is_if_undef(a, var, not_undef)) {
-        e2 = b + var;
-        return true;
-      } else if (a.isConst() && is_if_undef(b, var, not_undef)) {
-        e2 = a + var;
-        return true;
+  for (auto &var : vars) {
+    if (var.fn_name().starts_with("isundef_")) {
+      expr test = var == 0;
+      if (domain.UB.contains(test)) {
+        conds &= test;
+        repls.emplace_back(std::move(test), true);
+      } else {
+        missing_tests.emplace(var);
       }
+    } else {
+      has_undef = has_undef || isUndef(var);
     }
-    return false;
-  };
-
-  expr c, a, b, lhs, rhs;
-
-  // two variants
-  // 1) boolean
-  if (is_if_undef(e, a, b)) {
-    addUB(std::move(b));
-    return a;
   }
 
-  auto has_undef = [&](const expr &e) {
-    auto vars = e.vars();
-    return any_of(vars.begin(), vars.end(),
-                  [&](auto &v) { return isUndef(v); });
-  };
+  if (missing_tests.empty() && !has_undef)
+    return e.subst_simplify(repls);
 
-  auto mark_notundef = [&](const expr &var) {
+  expr e2;
+  {
+    auto repls2 = repls;
+    for (auto &u : undef_vars) {
+      repls2.emplace_back(u, expr::mkFreshVar("undef", u));
+    }
+    e2 = e.subst(repls2);
+  }
+
+  set<expr> qvars;
+  for (auto &var : vars) {
     auto name = var.fn_name();
-    for (auto &[v, _val] : values) {
-      if (v->getName() == name) {
-        analysis.non_undef_vals.emplace(v, var);
-        return;
+    if (name.starts_with("isundef_") || name.starts_with("undef!") ||
+        var.isQVar())
+      continue;
+    qvars.emplace(var);
+  }
+
+  Solver s;
+  s.add(conds);
+  s.add(expr::mkForAll(qvars, !eq_except_padding(getMemory(), val.getType(), e,
+                                                 e2, ptr_compare)));
+  bool all_decided = true;
+
+  // check each undef var in turn by making all other vars non-undef
+  // if the expressions yields a different value, then the selected var can't
+  // be undef
+  for (auto &var : missing_tests) {
+    SolverPush push(s);
+    for (auto &miss_var : missing_tests) {
+      expr test = miss_var == 0;
+      if (miss_var.eq(var)) {
+        test = !test;
       }
+      s.add(test);
     }
-  };
-
-  if (e.isIf(c, a, b) && a.isConst() && b.isConst()) {
-    expr val, val2, newe, newe2, not_undef, not_undef2;
-    // (ite (= val (ite (= #b0 isundef_%var) %var undef)) #b1 #b0)
-    // (ite (= val (bvadd c (ite (= #b0 isundef_%var) %var undef)) #b1 #b0)
-    if (c.isEq(lhs, rhs)) {
-      if (is_if_undef_or_add(lhs, val, not_undef, newe) && !has_undef(rhs)) {
-        addUB(std::move(not_undef));
-        mark_notundef(val);
-        // %var == rhs
-        // (bvadd c %var) == rhs
-        return expr::mkIf(newe == rhs, a, b);
+    auto res = s.check("non-undef inference", true);
+    expr test = var == 0;
+    if (res.isSat()) { // var can't be undef
+      addUB(test);
+      auto var_name = var.fn_name().substr(sizeof("isundef_") - 1);
+      // mark the var as non-undef for future uses
+      for (auto &[v, val] : values) {
+        if (v->getName() == var_name) {
+          analysis.non_undef_vals.emplace(
+              v, val.val.value.subst(test, true).simplify());
+          break;
+        }
       }
-      if (is_if_undef_or_add(rhs, val, not_undef, newe) && !has_undef(lhs)) {
-        addUB(std::move(not_undef));
-        mark_notundef(val);
-        return expr::mkIf(lhs == newe, a, b);
-      }
-      if (is_if_undef_or_add(lhs, val, not_undef, newe) &&
-          is_if_undef_or_add(rhs, val2, not_undef2, newe2)) {
-        addUB(std::move(not_undef));
-        addUB(std::move(not_undef2));
-        mark_notundef(val);
-        mark_notundef(val2);
-        return expr::mkIf(newe == newe2, a, b);
-      }
-    }
-
-    if (c.isSLE(lhs, rhs)) {
-      // (ite (bvsle val (ite (= #b0 isundef_%var) %var undef)) #b1 #b0)
-      // (ite (bvsle val (bvadd c (ite (= #b0 isundef_%var) %var undef))
-      //       #b1 #b0)
-      if (is_if_undef_or_add(rhs, val, not_undef, newe) && !has_undef(lhs)) {
-        expr cond = lhs == expr::IntSMin(lhs.bits());
-        addUB(not_undef || cond);
-        if (cond.isFalse())
-          mark_notundef(val);
-        // lhs <=s %var
-        // lhs <=s (bvadd c %var)
-        return expr::mkIf(lhs.sle(newe), a, b);
-      }
-
-      // (ite (bvsle (ite (= #b0 isundef_%var) %var undef) val) #b1 #b0)
-      // (ite (bvsle (bvadd c (ite (= #b0 isundef_%var) %var undef)) val)
-      //       #b1 #b0)
-      if (is_if_undef_or_add(lhs, val, not_undef, newe) && !has_undef(rhs)) {
-        expr cond = rhs == expr::IntSMax(rhs.bits());
-        addUB(not_undef || cond);
-        if (cond.isFalse())
-          mark_notundef(val);
-        return expr::mkIf(newe.sle(rhs), a, b);
-      }
-
-      // undef <= undef
-      if (is_if_undef_or_add(lhs, val, not_undef, newe) &&
-          is_if_undef_or_add(rhs, val2, not_undef2, newe2)) {
-        addUB((not_undef && not_undef2) ||
-              (not_undef && newe == expr::IntSMin(lhs.bits())) ||
-              (not_undef2 && newe2 == expr::IntSMax(rhs.bits())));
-        return expr::mkIf(newe.sle(newe2), a, b);
-      }
-    }
-
-    if (c.isULE(lhs, rhs)) {
-      // (ite (bvule val (ite (= #b0 isundef_%var) %var undef)) #b1 #b0)
-      // (ite (bvule val (bvadd c (ite (= #b0 isundef_%var) %var undef)))
-      //       #b1 #b0)
-      if (is_if_undef_or_add(rhs, val, not_undef, newe) && !has_undef(lhs)) {
-        expr cond = lhs == 0;
-        addUB(not_undef || cond);
-        if (cond.isFalse())
-          mark_notundef(val);
-        // lhs <=u %var
-        // lhs <=u (bvadd c %var)
-        return expr::mkIf(lhs.ule(newe), a, b);
-      }
-
-      // (ite (bvule (ite (= #b0 isundef_%var) %var undef) val) #b1 #b0)
-      // (ite (bvule (bvadd c (ite (= #b0 isundef_%var) %var undef)) %val)
-      //       #b1 #b0)
-      if (is_if_undef_or_add(lhs, val, not_undef, newe) && !has_undef(rhs)) {
-        expr cond = rhs == expr::mkInt(-1, rhs);
-        addUB(not_undef || cond);
-        if (cond.isFalse())
-          mark_notundef(val);
-        return expr::mkIf(newe.ule(rhs), a, b);
-      }
-
-      // undef <= undef
-      if (is_if_undef_or_add(lhs, val, not_undef, newe) &&
-          is_if_undef_or_add(rhs, val2, not_undef2, newe2)) {
-        addUB((not_undef && not_undef2) ||
-              (not_undef && newe == 0) ||
-              (not_undef2 && newe2 == expr::mkInt(-1, rhs)));
-        return expr::mkIf(newe.ule(newe2), a, b);
-      }
+      repls.emplace_back(std::move(test), true);
+    } else {
+      // can't conclude anything
+      all_decided = false;
+      break;
     }
   }
 
-  // 2) (or (and |isundef_%var| undef) (and %var (not |isundef_%var|)))
-  // TODO
+  if (all_decided) {
+    e2 = e.subst_simplify(repls);
+    auto vars = e2.vars();
+    // if there are still undef variables (not originating from inputs),
+    // we need to account for the extra conditions that make it non-undef
+    auto I = ranges::find_if(vars, [&](auto &var) { return isUndef(var); });
+    if (I == vars.end())
+      return e2;
+  }
 
   // check if original expression is equal to an expression where undefs are
   // fixed to a const value
-  vector<pair<expr,expr>> repls;
+  auto repls2 = repls;
   for (auto &undef : undef_vars) {
     expr newv = expr::mkFreshVar("#undef'", undef);
     addQuantVar(newv);
-    repls.emplace_back(undef, std::move(newv));
+    repls2.emplace_back(undef, std::move(newv));
   }
-  addUB(eq_except_padding(getMemory(), val.getType(), e, e.subst(repls),
+  addUB(eq_except_padding(getMemory(), val.getType(), e, e.subst(repls2),
                           ptr_compare));
-  return e;
+  return e.subst_simplify(repls);
 }
 
 void State::check_enough_tmp_slots() {
@@ -514,14 +485,14 @@ void State::check_enough_tmp_slots() {
     throw AliveException("Too many temporaries", false);
 }
 
-const StateValue& State::eval(const Value &val, bool quantify_nondet) {
+const StateValue &State::eval(const Value &val, bool quantify_nondet) {
   auto &[sval, _retdom, _ub, uvars] = values.at(&val);
 
   auto undef_itr = analysis.non_undef_vals.find(&val);
   bool is_non_undef = undef_itr != analysis.non_undef_vals.end();
   bool is_non_poison = analysis.non_poison_vals.count(&val);
 
-  auto simplify = [&](StateValue &sv0, bool use_new_slot) -> StateValue& {
+  auto simplify = [&](StateValue &sv0, bool use_new_slot) -> StateValue & {
     if (!is_non_undef && !is_non_poison)
       return sv0;
 
@@ -593,9 +564,9 @@ const StateValue& State::eval(const Value &val, bool quantify_nondet) {
   return simplify(tmp_values[i_tmp_values - 1], false);
 }
 
-const StateValue& State::getAndAddUndefs(const Value &val) {
+const StateValue &State::getAndAddUndefs(const Value &val) {
   auto &v = (*this)[val];
-  for (auto uvar: at(val)->undef_vars)
+  for (auto uvar : at(val)->undef_vars)
     addQuantVar(std::move(uvar));
   return v;
 }
@@ -620,9 +591,8 @@ static expr not_poison_except_padding(const Type &ty, const expr &np) {
   return result;
 }
 
-const StateValue&
-State::getAndAddPoisonUB(const Value &val, bool undef_ub_too,
-                         bool ptr_compare) {
+const StateValue &State::getAndAddPoisonUB(const Value &val, bool undef_ub_too,
+                                           bool ptr_compare) {
   auto &sv = (*this)[val];
 
   bool poison_already_added = !analysis.non_poison_vals.insert(&val).second;
@@ -632,19 +602,17 @@ State::getAndAddPoisonUB(const Value &val, bool undef_ub_too,
   expr v = sv.value;
 
   if (undef_ub_too) {
-    auto I = analysis.non_undef_vals.find(&val);
-    if (I != analysis.non_undef_vals.end()) {
-      v = I->second;
-    } else {
-      v = strip_undef_and_add_ub(val, v, ptr_compare);
-      analysis.non_undef_vals.emplace(&val, v);
+    auto [I, inserted] = analysis.non_undef_vals.try_emplace(&val);
+    if (inserted) {
+      I->second = strip_undef_and_add_ub(val, v, ptr_compare);
     }
+    v = I->second;
   }
 
   if (!poison_already_added) {
     // mark all operands of val as non-poison if they propagate poison
-    vector<Value*> todo;
-    if (auto i = dynamic_cast<const Instr*>(&val)) {
+    vector<Value *> todo;
+    if (auto i = dynamic_cast<const Instr *>(&val)) {
       if (i->propagatesPoison())
         todo = i->operands();
     }
@@ -653,7 +621,7 @@ State::getAndAddPoisonUB(const Value &val, bool undef_ub_too,
       todo.pop_back();
       if (!analysis.non_poison_vals.insert(v).second)
         continue;
-      if (auto i = dynamic_cast<const Instr*>(v)) {
+      if (auto i = dynamic_cast<const Instr *>(v)) {
         if (i->propagatesPoison()) {
           auto ops = i->operands();
           todo.insert(todo.end(), ops.begin(), ops.end());
@@ -667,30 +635,58 @@ State::getAndAddPoisonUB(const Value &val, bool undef_ub_too,
 
   check_enough_tmp_slots();
 
-  return tmp_values[i_tmp_values++] = { std::move(v),
-           sv.non_poison.isBool() ? true : expr::mkInt(-1, sv.non_poison) };
+  return tmp_values[i_tmp_values++] = {
+             std::move(v),
+             sv.non_poison.isBool() ? true : expr::mkInt(-1, sv.non_poison)};
 }
 
-const StateValue& State::getVal(const Value &val, bool is_poison_ub) {
+const StateValue &State::getVal(const Value &val, bool is_poison_ub) {
   return is_poison_ub ? getAndAddPoisonUB(val) : (*this)[val];
 }
 
-const expr& State::getWellDefinedPtr(const Value &val) {
+const expr &State::getWellDefinedPtr(const Value &val) {
   return getAndAddPoisonUB(val, true, true).value;
 }
 
-const State::ValTy* State::at(const Value &val) const {
+StateValue State::freeze(const Type &ty, const StateValue &v) {
+  if (auto agg = ty.getAsAggregateType()) {
+    vector<StateValue> vals;
+    for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
+      if (agg->isPadding(i))
+        continue;
+      vals.emplace_back(freeze(agg->getChild(i), agg->extract(v, i)));
+    }
+    return agg->aggregateVals(vals);
+  }
+
+  if (v.non_poison.isTrue())
+    return v;
+
+  expr nondet = expr::mkFreshVar("nondet", v.value);
+  addQuantVar(nondet);
+
+  if (ty.isPtrType())
+    memory.constrainFreezePointer({memory, nondet});
+
+  return {expr::mkIf(v.non_poison, v.value, nondet), true};
+}
+
+const State::ValTy *State::at(const Value &val) const {
   auto I = values.find(&val);
   return I == values.end() ? nullptr : &I->second;
 }
 
-const OrExpr* State::jumpCondFrom(const BasicBlock &bb) const {
+const OrExpr *State::jumpCondFrom(const BasicBlock &bb) const {
   auto &pres = predecessor_data.at(current_bb);
   auto I = pres.find(&bb);
   return I == pres.end() ? nullptr : &I->second.path;
 }
 
 bool State::isUndef(const expr &e) const {
+  expr v;
+  unsigned h, l;
+  if (e.isExtract(v, h, l))
+    return isUndef(v);
   return undef_vars.count(e) != 0;
 }
 
@@ -701,7 +697,7 @@ bool State::isAsmMode() const {
 expr State::getPath(BasicBlock &bb) const {
   if (&f.getFirstBB() == &bb)
     return true;
-  
+
   auto I = predecessor_data.find(&bb);
   if (I == predecessor_data.end())
     return false; // Block is unreachable
@@ -725,13 +721,64 @@ void State::cleanupPredecessorData() {
   predecessor_data.clear();
 }
 
+void State::copyUBFrom(const BasicBlock &bb) {
+  if (config::disallow_ub_exploitation)
+    return;
+
+  // Time-travel UB: anything that happens before a possibly non-returning call
+  // can be moved up to the entry of the BB.
+  const Value *before_call = nullptr;
+  for (auto &i : bb.instrs()) {
+    if (auto *call = dynamic_cast<const FnCall *>(&i)) {
+      if (!call->hasAttribute(FnAttrs::WillReturn))
+        break;
+    }
+    before_call = &i;
+  }
+  if (!before_call)
+    return;
+
+  auto src_val_I = src_state->values.find(before_call);
+  assert(src_val_I != src_state->values.end());
+  domain.UB.add(src_val_I->second.domain);
+}
+
+void State::copyUBFromBB(
+    const unordered_map<const BasicBlock *, BasicBlockInfo> &tgt_data) {
+  auto I = src_bb_paths.find(domain.path);
+  if (I == src_bb_paths.end())
+    return;
+
+  for (auto *src_bb : I->second) {
+    bool all_paths_ok = true;
+    for (auto &[_, src_data] : src_state->predecessor_data.at(src_bb)) {
+      auto I = ranges::find_if(tgt_data, [&](const auto &p) {
+        return is_eq(p.second.path <=> src_data.path);
+      });
+      if (I == tgt_data.end() ||
+          !I->second.analysis.ranges_fn_calls.isLargerThanInclReads(
+              src_data.analysis.ranges_fn_calls)) {
+        all_paths_ok = false;
+        break;
+      }
+    }
+    if (all_paths_ok)
+      copyUBFrom(*src_bb);
+  }
+}
+
 bool State::startBB(const BasicBlock &bb) {
   assert(undef_vars.empty());
   ENSURE(seen_bbs.emplace(&bb).second);
   current_bb = &bb;
 
-  if (&f.getFirstBB() == &bb)
+  if (&f.getFirstBB() == &bb) {
+    if (src_state) {
+      copyUBFromBB({});
+      copyUBFrom(src_state->f.getFirstBB());
+    }
     return true;
+  }
 
   auto I = predecessor_data.find(&bb);
   if (I == predecessor_data.end())
@@ -741,16 +788,17 @@ bool State::startBB(const BasicBlock &bb) {
     throw_oom_exception();
 
   DisjointExpr<Memory> in_memory;
-  DisjointExpr<expr> UB, guardUB;
+  DisjointExpr<AndExpr> UB;
   DisjointExpr<VarArgsData> var_args_in;
   OrExpr path;
+
+  domain.UB = AndExpr();
 
   bool isFirst = true;
   for (auto &[src, data] : I->second) {
     path.add(data.path);
     expr p = data.path();
     UB.add_disj(data.UB, p);
-    guardUB.add_disj(data.guardUB, p);
 
     // This data is never used again, so clean it up to reduce mem consumption
     in_memory.add_disj(std::move(data.mem), p);
@@ -759,25 +807,29 @@ bool State::startBB(const BasicBlock &bb) {
     data.undef_vars.clear();
 
     if (isFirst)
-      analysis = std::move(data.analysis);
-    else {
+      analysis = data.analysis;
+    else
       analysis.meet_with(data.analysis);
-      data.analysis = {};
-    }
+
+    if (isSource())
+      data.analysis.clear_smt();
     isFirst = false;
   }
   assert(!isFirst);
 
-  domain.path    = std::move(path)();
-  domain.UB      = *std::move(UB)();
-  memory         = *std::move(in_memory)();
-  var_args_data  = *std::move(var_args_in)();
+  domain.UB.add(std::move(UB).factor());
+  domain.path = std::move(path)();
+  memory = *std::move(in_memory)();
+  var_args_data = *std::move(var_args_in)();
+
+  if (src_state)
+    copyUBFromBB(I->second);
 
   return domain;
 }
 
 void State::addJump(expr &&cond, const BasicBlock &dst0, bool always_jump) {
-  always_jump |= cond.isTrue();
+  always_jump = always_jump || cond.isTrue();
 
   cond &= domain.path;
   if (cond.isFalse() || !domain)
@@ -798,13 +850,13 @@ void State::addJump(expr &&cond, const BasicBlock &dst0, bool always_jump) {
     data.analysis = analysis;
     data.var_args = var_args_data;
   }
-  data.UB.add(domain.UB(), cond);
+  data.UB.add(domain.UB, cond);
   data.path.add(std::move(cond));
   data.undef_vars.insert(undef_vars.begin(), undef_vars.end());
   data.undef_vars.insert(domain.undef_vars.begin(), domain.undef_vars.end());
 
   if (always_jump)
-    addUB(expr(false));
+    domain.path = false;
 }
 
 void State::addJump(const BasicBlock &dst) {
@@ -827,7 +879,23 @@ void State::addReturn(StateValue &&val) {
   return_undef_vars.insert(undef_vars.begin(), undef_vars.end());
   return_undef_vars.insert(domain.undef_vars.begin(), domain.undef_vars.end());
   undef_vars.clear();
-  addUB(expr(false));
+  domain.path = false;
+}
+
+void State::addAxiom(AndExpr &&ands) {
+  assert(ands);
+  axioms.add(std::move(ands));
+}
+
+void State::addAxiom(expr &&axiom) {
+  assert(!axiom.isFalse());
+  axioms.add(std::move(axiom));
+}
+
+void State::addPre(expr &&cond, bool quantify_undefs) {
+  if (quantify_undefs && !cond.isConst())
+    quantified_vars.insert(undef_vars.begin(), undef_vars.end());
+  precondition.add(std::move(cond));
 }
 
 void State::addUB(pair<AndExpr, expr> &&ub) {
@@ -874,10 +942,15 @@ void State::addUnreachable() {
   unreachable_paths.add(domain());
 }
 
-expr State::FnCallInput::implies(const FnCallInput &rhs) const {
-  if (noret != rhs.noret || willret != rhs.willret ||
-      (rhs.memaccess.canReadSomething().isTrue() &&
-        (fncall_ranges != rhs.fncall_ranges || is_neq(m <=> rhs.m))))
+expr State::FnCallInput::refines(const FnCallInput &rhs) const {
+  if (rhs.memaccess.canReadSomething().isTrue() &&
+      (fncall_ranges != rhs.fncall_ranges || is_neq(m <=> rhs.m)))
+    return false;
+
+  // we can remove attributes, but not add new ones
+  if (noret && !rhs.noret)
+    return false;
+  if (willret && !rhs.willret)
     return false;
 
   AndExpr eq;
@@ -893,16 +966,18 @@ expr State::FnCallInput::implies(const FnCallInput &rhs) const {
 }
 
 expr State::FnCallInput::refinedBy(
-  State &s, const string &callee, unsigned inaccessible_bid,
-  const vector<StateValue> &args_nonptr2,
-  const vector<Memory::PtrInput> &args_ptr2,
-  const ValueAnalysis::FnCallRanges &fncall_ranges2,
-  const Memory &m2, const SMTMemoryAccess &memaccess2, bool noret2,
-  bool willret2) const {
+    State &s, const string &callee, unsigned inaccessible_bid,
+    const vector<StateValue> &args_nonptr2, const vector<PtrInput> &args_ptr2,
+    const ValueAnalysis::FnCallRanges &fncall_ranges2, const Memory &m2,
+    const SMTMemoryAccess &memaccess2, bool noret2, bool willret2) const {
 
-  if (noret != noret2 ||
-      willret != willret2 ||
-      !fncall_ranges.overlaps(callee, memaccess2, fncall_ranges2))
+  if (!fncall_ranges.overlaps(callee, memaccess2, fncall_ranges2))
+    return false;
+
+  // we can remove attributes, but not add new ones
+  if (noret2 && !noret)
+    return false;
+  if (willret2 && !willret)
     return false;
 
   AndExpr refines;
@@ -922,10 +997,9 @@ expr State::FnCallInput::refinedBy(
     auto &ptr1 = args_ptr[i];
     auto &ptr2 = args_ptr2[i];
     expr eq_val = Pointer(m, ptr1.val.value)
-                    .fninputRefined(Pointer(m2, ptr2.val.value),
-                                    undef_vars, ptr2.byval);
-    refines.add(ptr1.val.non_poison.implies(ptr2.val.non_poison &&
-                                            eq_val &&
+                      .fninputRefined(Pointer(m2, ptr2.val.value), undef_vars,
+                                      ptr2.byval);
+    refines.add(ptr1.val.non_poison.implies(ptr2.val.non_poison && eq_val &&
                                             ptr1.implies_attrs(ptr2)));
 
     if (!refines)
@@ -937,17 +1011,17 @@ expr State::FnCallInput::refinedBy(
 
   if (memaccess2.canReadSomething().isTrue()) {
     bool argmemonly = memaccess2.canOnlyRead(MemoryAccess::Args).isTrue();
-    vector<Memory::PtrInput> dummy1, dummy2;
+    vector<PtrInput> dummy1, dummy2;
     auto restrict_ptrs = argmemonly ? &args_ptr : nullptr;
     auto restrict_ptrs2 = argmemonly ? &args_ptr2 : nullptr;
     if (memaccess2.canOnlyRead(MemoryAccess::Inaccessible).isTrue()) {
       assert(inaccessible_bid != -1u);
-      dummy1.emplace_back(0,
-        StateValue(Pointer(m, inaccessible_bid, false).release(), true), 0,
-        false, false, false);
-      dummy2.emplace_back(0,
-        StateValue(Pointer(m2, inaccessible_bid, false).release(), true), 0,
-        false, false, false);
+      dummy1.emplace_back(
+          0, StateValue(Pointer(m, inaccessible_bid, false).release(), true), 0,
+          false, false, false);
+      dummy2.emplace_back(
+          0, StateValue(Pointer(m2, inaccessible_bid, false).release(), true),
+          0, false, false, false);
       assert(!restrict_ptrs && !restrict_ptrs2);
       restrict_ptrs = &dummy1;
       restrict_ptrs2 = &dummy2;
@@ -972,27 +1046,28 @@ State::FnCallOutput State::FnCallOutput::mkIf(const expr &cond,
                                               const FnCallOutput &a,
                                               const FnCallOutput &b) {
   FnCallOutput ret;
-  ret.retval    = StateValue::mkIf(cond, a.retval, b.retval);
-  ret.ub        = expr::mkIf(cond, a.ub, b.ub);
+  ret.retval = StateValue::mkIf(cond, a.retval, b.retval);
+  ret.ub = expr::mkIf(cond, a.ub, b.ub);
   ret.noreturns = expr::mkIf(cond, a.noreturns, b.noreturns);
   ret.callstate = Memory::CallState::mkIf(cond, a.callstate, b.callstate);
 
   assert(a.ret_data.size() == b.ret_data.size());
   for (unsigned i = 0, e = a.ret_data.size(); i != e; ++i) {
     ret.ret_data.emplace_back(
-      Memory::FnRetData::mkIf(cond, a.ret_data[i], b.ret_data[i]));
+        Memory::FnRetData::mkIf(cond, a.ret_data[i], b.ret_data[i]));
   }
   return ret;
 }
 
-expr State::FnCallOutput::implies(const FnCallOutput &rhs,
+expr State::FnCallOutput::refines(const FnCallOutput &rhs,
                                   const Type &retval_ty) const {
   expr ret = ub == rhs.ub;
-  ret     &= noreturns == rhs.noreturns;
-  ret     &= callstate == rhs.callstate;
+  ret &= noreturns == rhs.noreturns;
+  ret &= callstate == rhs.callstate;
 
-  function<void(const StateValue&, const StateValue&, const Type&)> check_out
-    = [&](const StateValue &a, const StateValue &b, const Type &ty) -> void {
+  function<void(const StateValue &, const StateValue &, const Type &)>
+      check_out = [&](const StateValue &a, const StateValue &b,
+                      const Type &ty) -> void {
     if (auto agg = ty.getAsAggregateType()) {
       for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
         if (!agg->isPadding(i))
@@ -1006,13 +1081,12 @@ expr State::FnCallOutput::implies(const FnCallOutput &rhs,
   return ret;
 }
 
-StateValue
-State::addFnCall(const string &name, vector<StateValue> &&inputs,
-                 vector<Memory::PtrInput> &&ptr_inputs,
-                 const Type &out_type, StateValue &&ret_arg,
-                 const Type *ret_arg_ty, vector<StateValue> &&ret_args,
-                 const FnAttrs &attrs, unsigned indirect_call_hash) {
-  bool noret   = attrs.has(FnAttrs::NoReturn);
+StateValue State::addFnCall(const string &name, vector<StateValue> &&inputs,
+                            vector<PtrInput> &&ptr_inputs, const Type &out_type,
+                            StateValue &&ret_arg, const Type *ret_arg_ty,
+                            vector<StateValue> &&ret_args, const FnAttrs &attrs,
+                            unsigned indirect_call_hash) {
+  bool noret = attrs.has(FnAttrs::NoReturn);
   bool willret = attrs.has(FnAttrs::WillReturn);
   bool noundef = attrs.has(FnAttrs::NoUndef);
   bool noalias = attrs.has(FnAttrs::NoAlias);
@@ -1026,10 +1100,9 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
 
   assert(!noret || !willret);
 
-  bool all_valid = std::all_of(inputs.begin(), inputs.end(),
-                                [](auto &v) { return v.isValid(); }) &&
-                   std::all_of(ptr_inputs.begin(), ptr_inputs.end(),
-                                [](auto &v) { return v.val.isValid(); });
+  bool all_valid =
+      ranges::all_of(inputs, [](auto &v) { return v.isValid(); }) &&
+      ranges::all_of(ptr_inputs, [](auto &v) { return v.val.isValid(); });
 
   if (!all_valid) {
     addUB(expr());
@@ -1063,8 +1136,8 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
             (decl.is_varargs && ptr.idx < decl.inputs.size()))
           continue;
         auto &attrs = decl.inputs[ptr.idx].second;
-        ptr.byval   = expr::mkIf(cmp, expr::mkUInt(attrs.blockSize, 64),
-                                 ptr.byval);
+        ptr.byval =
+            expr::mkIf(cmp, expr::mkUInt(attrs.blockSize, 64), ptr.byval);
         if (attrs.has(ParamAttrs::NoRead))
           ptr.noread |= cmp;
         if (attrs.has(ParamAttrs::NoWrite))
@@ -1074,8 +1147,9 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
       }
     }
 
-    memaccess &= *std::move(decl_access).mk(SMTMemoryAccess{
-      expr::mkUF("#access_" + name, { fn_ptr_bid }, memaccess.val)});
+    memaccess &= *std::move(decl_access)
+                      .mk(SMTMemoryAccess{expr::mkUF(
+                          "#access_" + name, {fn_ptr_bid}, memaccess.val)});
   }
 
   if (!memaccess.canWrite(MemoryAccess::Args).isFalse() ||
@@ -1091,17 +1165,19 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
   unsigned inaccessible_bid = -1u;
   if (!memaccess.canOnlyRead(MemoryAccess::Inaccessible).isFalse() ||
       !memaccess.canOnlyWrite(MemoryAccess::Inaccessible).isFalse())
-    inaccessible_bid
-      = inaccessiblemem_bids.try_emplace(name, inaccessiblemem_bids.size())
-                            .first->second;
+    inaccessible_bid =
+        inaccessiblemem_bids.try_emplace(name, inaccessiblemem_bids.size())
+            .first->second;
 
-  State::ValueAnalysis::FnCallRanges call_ranges;
+  ValueAnalysis::FnCallRanges call_ranges;
   if (!memaccess.canRead(MemoryAccess::Inaccessible).isFalse() ||
       !memaccess.canRead(MemoryAccess::Errno).isFalse() ||
       !memaccess.canRead(MemoryAccess::Other).isFalse())
     call_ranges = memaccess.canOnlyRead(MemoryAccess::Inaccessible).isTrue()
-                    ? analysis.ranges_fn_calls.project(name)
-                    : analysis.ranges_fn_calls;
+                      ? analysis.ranges_fn_calls.project(name)
+                      : analysis.ranges_fn_calls;
+
+  call_ranges.keep_only_writes();
 
   if (ret_arg_ty && (*ret_arg_ty == out_type).isFalse()) {
     ret_arg = out_type.fromInt(ret_arg_ty->toInt(*this, std::move(ret_arg)));
@@ -1110,12 +1186,11 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
   // source may create new fn symbols, target just references src symbols
   if (isSource()) {
     auto &calls_fn = fn_call_data[name];
-    auto call_data_pair
-      = calls_fn.try_emplace(
-          { std::move(inputs), std::move(ptr_inputs), std::move(call_ranges),
-            memaccess.canReadSomething().isFalse()
-              ? memory.dupNoRead() : memory.dup(),
-            memaccess, noret, willret });
+    auto call_data_pair = calls_fn.try_emplace(
+        {std::move(inputs), std::move(ptr_inputs), std::move(call_ranges),
+         memaccess.canReadSomething().isFalse() ? memory.dupNoRead()
+                                                : memory.dup(),
+         memaccess, noret, willret});
     auto &I = call_data_pair.first;
     bool inserted = call_data_pair.second;
 
@@ -1128,19 +1203,19 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
         return noundef ? std::move(np) : expr::mkFreshVar(npname.c_str(), np);
       };
 
-      function<StateValue(const Type &)> mk_output
-        = [&](const Type &ty) -> StateValue {
+      function<StateValue(const Type &)> mk_output =
+          [&](const Type &ty) -> StateValue {
         if (ty.isPtrType()) {
-          auto [val, mem]
-            = memory.mkFnRet(name.c_str(), I->first.args_ptr, noalias);
+          auto [val, mem] =
+              memory.mkFnRet(name.c_str(), I->first.args_ptr, noalias);
           ret_data.emplace_back(std::move(mem));
-          return { std::move(val), mk_np(true) };
+          return {std::move(val), mk_np(true)};
         }
 
         if (!hasPtr(ty)) {
           auto dummy = ty.getDummyValue(true);
-          return { expr::mkFreshVar(name.c_str(), dummy.value),
-                   mk_np(std::move(dummy.non_poison)) };
+          return {expr::mkFreshVar(name.c_str(), dummy.value),
+                  mk_np(std::move(dummy.non_poison))};
         }
 
         assert(ty.isAggregateType());
@@ -1180,22 +1255,22 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
         }
       }
 
-      I->second
-        = { std::move(output), expr::mkFreshVar((name + "#ub").c_str(), false),
-            (noret || willret)
-              ? expr(noret)
-              : expr::mkFreshVar((name + "#noreturn").c_str(), false),
-            memory.mkCallState(name, attrs.has(FnAttrs::NoFree),
-                               I->first.args_ptr.size(), memaccess),
-            std::move(ret_data) };
+      I->second = {std::move(output),
+                   expr::mkFreshVar((name + "#ub").c_str(), false),
+                   (noret || willret)
+                       ? expr(noret)
+                       : expr::mkFreshVar((name + "#noreturn").c_str(), false),
+                   memory.mkCallState(name, attrs.has(FnAttrs::NoFree),
+                                      I->first.args_ptr.size(), memaccess),
+                   std::move(ret_data)};
 
       // add equality constraints between source's function calls
       for (auto II = calls_fn.begin(), E = calls_fn.end(); II != E; ++II) {
         if (II == I)
           continue;
-        auto in_eq = I->first.implies(II->first);
+        auto in_eq = I->first.refines(II->first);
         if (!in_eq.isFalse())
-          fn_call_pre &= in_eq.implies(I->second.implies(II->second, out_type));
+          fn_call_pre &= in_eq.implies(I->second.refines(II->second, out_type));
       }
     }
 
@@ -1204,15 +1279,14 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
     retval = I->second.retval;
     memory.setState(I->second.callstate, memaccess, I->first.args_ptr,
                     inaccessible_bid);
-  }
-  else {
+  } else {
     // target: this fn call must match one from the source, otherwise it's UB
     ChoiceExpr<FnCallOutput> data;
 
     for (auto &[in, out] : fn_call_data[name]) {
-      auto refined = in.refinedBy(*this, name, inaccessible_bid, inputs,
-                                  ptr_inputs, call_ranges, memory, memaccess,
-                                  noret, willret);
+      auto refined =
+          in.refinedBy(*this, name, inaccessible_bid, inputs, ptr_inputs,
+                       call_ranges, memory, memaccess, noret, willret);
       data.add(ret_arg_ty ? out.replace(ret_arg) : out, std::move(refined));
     }
 
@@ -1231,12 +1305,14 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
         // bid may be different from that of src
         unsigned i = 0;
         auto &ret_data = d.ret_data;
-        function<StateValue(const Type &, StateValue &&)> mk_output
-          = [&](const Type &ty, StateValue &&val) -> StateValue {
+        function<StateValue(const Type &, StateValue &&)> mk_output =
+            [&](const Type &ty, StateValue &&val) -> StateValue {
           if (ty.isPtrType()) {
-            return { memory.mkFnRet(name.c_str(), ptr_inputs, noalias,
-                                    &ret_data[i++]).first,
-                     std::move(val.non_poison) };
+            return {
+                memory
+                    .mkFnRet(name.c_str(), ptr_inputs, noalias, &ret_data[i++])
+                    .first,
+                std::move(val.non_poison)};
           }
 
           if (!hasPtr(ty))
@@ -1247,7 +1323,7 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
           vector<StateValue> vals;
           for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
             vals.emplace_back(
-              mk_output(agg->getChild(i), agg->extract(val, i)));
+                mk_output(agg->getChild(i), agg->extract(val, i)));
           }
           return agg->aggregateVals(vals);
         };
@@ -1271,8 +1347,9 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
   return retval;
 }
 
-void State::doesApproximation(string &&name, optional<expr> e) {
-  used_approximations.emplace(std::move(name), std::move(e));
+void State::doesApproximation(string &&name, optional<expr> e,
+                              bool must_be_true) {
+  used_approximations.emplace(std::move(name), std::move(e), must_be_true);
 }
 
 void State::addQuantVar(const expr &var) {
@@ -1299,7 +1376,7 @@ void State::addUndefVar(expr &&var) {
 
 void State::resetUndefVars(bool quantify) {
   ((isSource() || !quantify) ? quantified_vars : fn_call_qvars)
-    .insert(undef_vars.begin(), undef_vars.end());
+      .insert(undef_vars.begin(), undef_vars.end());
   undef_vars.clear();
 }
 
@@ -1339,6 +1416,18 @@ void State::finishInitializer() {
   }
 }
 
+bool State::isImplied(const expr &e, const expr &e_domain) {
+  if (domain.UB.contains(e))
+    return true;
+
+  if (check_expr((e_domain && domain()).notImplies(e), "UB inference", true)
+          .isUnsat()) {
+    domain.UB.add(e_domain.implies(e));
+    return true;
+  }
+  return false;
+}
+
 expr State::sinkDomain(bool include_ub) const {
   auto I = predecessor_data.find(&f.getSinkBB());
   if (I == predecessor_data.end())
@@ -1346,21 +1435,26 @@ expr State::sinkDomain(bool include_ub) const {
 
   OrExpr ret;
   for (auto &[src, data] : I->second) {
-    ret.add(data.path() && (include_ub ? *data.UB() : true));
+    ret.add(data.path() && (include_ub ? data.UB.factor()() : true));
   }
   return ret();
 }
 
-const StateValue& State::returnValCached() {
-  if (auto *v = get_if<DisjointExpr<StateValue>>(&return_val))
+const StateValue &State::returnValCached() {
+  if (auto *v = get_if<DisjointExpr<StateValue>>(&return_val)) {
     return_val = *std::move(*v)();
+    auto &val = get<StateValue>(return_val);
+    // there is no poison in asm mode
+    if (isAsmMode() && !val.non_poison.isTrue()) {
+      val = freeze(getFn().getType(), val);
+    }
+  }
   return get<StateValue>(return_val);
 }
 
-Memory& State::returnMemory() {
+Memory &State::returnMemory() {
   if (auto *m = get_if<DisjointExpr<Memory>>(&return_memory)) {
-    auto val = std::move(*m)();
-    return_memory = val ? *std::move(val) : memory.dup();
+    return_memory = *std::move(*m)();
   }
   return get<Memory>(return_memory);
 }
@@ -1372,7 +1466,7 @@ expr State::getJumpCond(const BasicBlock &src, const BasicBlock &dst) const {
 
   auto J = I->second.find(&src);
   return J == I->second.end() ? expr(false)
-                              : J->second.path() && *J->second.UB();
+                              : J->second.path() && J->second.UB.factor()();
 }
 
 void State::addGlobalVarBid(const string &glbvar, unsigned bid) {
@@ -1396,16 +1490,34 @@ void State::markGlobalAsAllocated(const string &glbvar) {
   itr->second.second = true;
 }
 
+bool State::isGVUsed(unsigned bid) const {
+  for (auto &[gv_name, data] : glbvar_bids) {
+    if (bid == data.first)
+      return getFn().getUsers().count(getFn().getGlobalVar(gv_name));
+  }
+  assert(false);
+  return false;
+}
+
 void State::syncSEdataWithSrc(State &src) {
   assert(glbvar_bids.empty());
   assert(src.isSource() && !isSource());
   glbvar_bids = src.glbvar_bids;
-  for (auto &itm : glbvar_bids)
-    itm.second.second = false;
-
+  for (auto &[gv_name, data] : glbvar_bids) {
+    data.second = false;
+  }
   fn_call_data = std::move(src.fn_call_data);
   inaccessiblemem_bids = std::move(src.inaccessiblemem_bids);
   memory.syncWithSrc(src.returnMemory());
+
+  src_state = &src;
+  for (auto &[bb, srcs] : src.predecessor_data) {
+    OrExpr path;
+    for (auto &[src, data] : srcs) {
+      path.add(data.path);
+    }
+    src_bb_paths[std::move(path)()].emplace_back(bb);
+  }
 }
 
 void State::mkAxioms(State &tgt) {
@@ -1418,12 +1530,20 @@ void State::mkAxioms(State &tgt) {
         Pointer ptr(memory, (*this)[*gv].value);
         addAxiom(!ptr.isLocal());
         addAxiom(ptr.getOffset() == 0);
-        addAxiom(
-          expr::mkUF("#fndeclty", { ptr.getShortBid() }, expr::mkUInt(0, 32))
-            == decl.hash());
+        addAxiom(expr::mkUF("#fndeclty", {ptr.getShortBid()},
+                            expr::mkUInt(0, 32)) == decl.hash());
       }
     }
   }
 }
 
+void State::cleanup() {
+  src_bb_paths.clear();
+  undef_vars.clear();
+  fn_call_data.clear();
+  domain = {};
+  analysis = {};
+  var_args_data = {};
 }
+
+} // namespace IR

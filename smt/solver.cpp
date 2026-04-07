@@ -433,6 +433,14 @@ void Solver::block(const Model &m, Solver *sneg) {
     assignments.insert(var == val);
   }
 
+  // FIXME: this doesn't handle the else case
+  // It would need an extra qualifier
+  for (const auto &[fn_name, model] : m.getFns()) {
+    for (const auto &[fn, val] : model) {
+      assignments.insert(fn == val);
+    }
+  }
+
   if (sneg) {
     // simple left-to-right variable discard algorithm
     for (auto I = assignments.begin(); I != assignments.end(); ) {
@@ -441,7 +449,7 @@ void Solver::block(const Model &m, Solver *sneg) {
       I = assignments.erase(I);
 
       sneg->add(expr::mk_and(assignments));
-      if (!sneg->check().isUnsat())
+      if (!sneg->check("block model").isUnsat())
         assignments.insert(std::move(val));
     }
   }
@@ -467,7 +475,7 @@ expr Solver::assertions() const {
   return ret;
 }
 
-Result Solver::check(const char *query_name) const {
+Result Solver::check(const char *query_name, bool dont_skip) const {
   if (!valid) {
     ++num_invalid;
     return Result::INVALID;
@@ -486,7 +494,8 @@ Result Solver::check(const char *query_name) const {
     if (!fml.isTrue()) {
       auto str = Z3_benchmark_to_smtlib_string(ctx(), banner, nullptr, nullptr,
                                                nullptr, 0, nullptr, fml());
-      ofstream file(get_random_filename(config::smt_benchmark_dir, "smt2", query_name));
+      ofstream file(
+        get_random_filename(config::smt_benchmark_dir, "smt2", query_name));
       if (!file.is_open()) {
         dbg() << "Alive2: Couldn't open smtlib benchmark file!" << endl;
         exit(1);
@@ -495,18 +504,15 @@ Result Solver::check(const char *query_name) const {
     }
   }
 
-  if (config::skip_smt) {
+  if (config::skip_smt && !dont_skip) {
     ++num_skips;
     return Result::SKIP;
   }
 
   ++num_queries;
   if (print_queries) {
-    dbg() << "\nSMT query";
-    if (query_name != nullptr) {
-      dbg() << " (" << query_name << ')';
-    }
-    dbg() << ":\n" << Z3_solver_to_string(ctx(), s) << endl;
+    dbg() << "\nSMT query (" << query_name << "):\n"
+          << Z3_solver_to_string(ctx(), s) << endl;
   }
 
   tactic->check();
@@ -532,10 +538,10 @@ Result Solver::check(const char *query_name) const {
   }
 }
 
-Result check_expr(const expr &e, const char *query_name) {
+Result check_expr(const expr &e, const char *query_name, bool dont_skip) {
   Solver s;
   s.add(e);
-  return s.check(query_name);
+  return s.check(query_name, dont_skip);
 }
 
 

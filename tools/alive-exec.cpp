@@ -45,8 +45,7 @@ StateValue eval(const Result &r, const StateValue &v) {
   return { m[v.value], m[v.non_poison] };
 }
 
-optional<StateValue> exec(llvm::Function &F,
-                          llvm::TargetLibraryInfoWrapperPass &TLI) {
+StateValue exec(llvm::Function &F, llvm::TargetLibraryInfoWrapperPass &TLI) {
   auto Func = llvm2alive(F, TLI.getTLI(F), true);
   if (!Func) {
     cerr << "ERROR: Could not translate '" << F.getName().str()
@@ -54,7 +53,7 @@ optional<StateValue> exec(llvm::Function &F,
     return {};
   }
 
-  if (!opt_quiet)
+  if (!config::quiet)
     Func->print(cout << "\n----------------------------------------\n");
 
   {
@@ -99,7 +98,7 @@ optional<StateValue> exec(llvm::Function &F,
     auto It = curr_bb->instrs().begin();
     Solver solver(true);
 
-    if (!opt_quiet)
+    if (!config::quiet)
       cout << "Executing " << curr_bb->getName() << '\n';
 
     while (true) {
@@ -113,14 +112,14 @@ optional<StateValue> exec(llvm::Function &F,
       auto &name = next_instr.getName();
 
       solver.add(val.return_domain);
-      auto r = solver.check();
+      auto r = solver.check("return domain");
       if (error(r))
         return {};
 
       if (dynamic_cast<const Return*>(&next_instr)) {
         assert(r.isSat());
         auto ret = eval(r, state.returnVal().val);
-        if (!opt_quiet)
+        if (!config::quiet)
           cout << "Returned " << ret << '\n';
         return ret;
       }
@@ -132,12 +131,12 @@ optional<StateValue> exec(llvm::Function &F,
           {
             SolverPush push(solver);
             solver.add(cond);
-            auto r = solver.check();
+            auto r = solver.check("jump condition");
             if (error(r))
               return {};
 
             if (r.isSat()) {
-              if (!opt_quiet)
+              if (!config::quiet)
                 cout << "  >> Jump to " << dst.getName() << "\n\n";
               curr_bb = &dst;
               state.startBB(dst);
@@ -156,8 +155,8 @@ optional<StateValue> exec(llvm::Function &F,
         continue;
       }
 
-      solver.add(val.domain);
-      r = solver.check();
+      solver.add(val.domain());
+      r = solver.check("domain");
       if (error(r))
         return {};
 
@@ -166,7 +165,7 @@ optional<StateValue> exec(llvm::Function &F,
         return {};
       }
 
-      if (!opt_quiet) {
+      if (!config::quiet) {
         cout << name;
         if (name[0] == '%') {
           auto v = eval(r, val.val);
@@ -186,6 +185,14 @@ optional<StateValue> exec(llvm::Function &F,
     return {};
   }
   UNREACHABLE();
+}
+
+void exec(llvm::Function &F, llvm::TargetLibraryInfoWrapperPass &TLI,
+          int &ret_val, bool &ret_val_poison) {
+  int64_t n;
+  auto ret = exec(F, TLI);
+  ret_val_poison = ret.non_poison.isFalse();
+  ret_val = ret.value.isInt(n) ? (int)n : -1;
 }
 }
 
@@ -226,7 +233,7 @@ If it doesn't exist, alive-exec executes every function in the bitcode file.
   }
 
 #define ARGS_MODULE_VAR M
-# include "llvm_util/cmd_args_def.h"
+#include "llvm_util/cmd_args_def.h"
 
   auto &DL = M.get()->getDataLayout();
   llvm::Triple targetTriple(M.get()->getTargetTriple());
@@ -236,11 +243,12 @@ If it doesn't exist, alive-exec executes every function in the bitcode file.
   smt::smt_initializer smt_init;
 
   auto *main_fn = findFunction(*M, "main");
-  optional<StateValue> ret_val;
+  int ret_val = -1;
+  bool ret_val_poison = false;
 
   if (main_fn && func_names.empty()) {
     State::resetGlobals();
-    ret_val = exec(*main_fn, TLI);
+    exec(*main_fn, TLI, ret_val, ret_val_poison);
   } else {
     for (auto &F : *M) {
       if (F.isDeclaration())
@@ -249,15 +257,13 @@ If it doesn't exist, alive-exec executes every function in the bitcode file.
         continue;
       State::resetGlobals();
       smt_init.reset();
-      ret_val = exec(F, TLI);
+      exec(F, TLI, ret_val, ret_val_poison);
     }
   }
 
-  if (ret_val) {
-    int64_t n = 0;
-    ret_val->value.isInt(n);
-    return (int)n;
-  } else {
+  if (ret_val_poison) {
+    cerr << "ERROR: program returned poison\n";
     return -1;
   }
+  return ret_val;
 }

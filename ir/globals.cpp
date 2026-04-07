@@ -13,7 +13,7 @@ namespace IR {
 unsigned num_locals_src = 128;
 unsigned num_locals_tgt = 128;
 unsigned num_consts_src = 128;
-unsigned num_globals_src = 256;
+unsigned num_globals_src = 128;
 unsigned num_ptrinputs = 64;
 unsigned num_inaccessiblememonly_fns = 32;
 unsigned num_nonlocals = 256;
@@ -39,22 +39,17 @@ bool has_nocapture = true;
 bool has_noread = true;
 bool has_nowrite = true;
 bool has_ptr_arg = true;
+bool has_initializes_attr = true;
 bool has_null_block = true;
 bool null_is_dereferenceable = false;
+bool has_globals_diff_align = true;
 bool does_int_mem_access = true;
 bool does_ptr_mem_access = true;
+bool does_int_load = true;
+bool does_int_store = true;
+bool does_ptr_load = true;
 bool does_ptr_store = true;
 unsigned heap_block_alignment = 8;
 bool has_indirect_fncalls = true;
-
-
-bool isUndef(const expr &e) {
-  expr var;
-  unsigned h, l;
-  if (e.isExtract(var, h, l))
-    return isUndef(var);
-
-  return string_view(e.fn_name()).substr(0, 6) == "undef!";
-}
 
 }

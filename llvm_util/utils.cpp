@@ -9,6 +9,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IRReader/IRReader.h"
@@ -105,12 +106,16 @@ string value_name(const llvm::Value &v) {
                                         : "%#" + to_string(value_id_counter++);
 }
 
-Type& get_int_type(unsigned bits) {
+Type* get_int_type(unsigned bits) {
+  if (bits > 16 * 1024) {
+    *out << "ERROR: integer type too large: i" << bits << "\n";
+    return nullptr;
+  }
   if (bits >= int_types.size())
     int_types.resize(bits + 1);
   if (!int_types[bits])
     int_types[bits] = make_unique<IntType>("i" + to_string(bits), bits);
-  return *int_types[bits].get();
+  return int_types[bits].get();
 }
 
 Type* llvm_type2alive(const llvm::Type *ty) {
@@ -118,7 +123,7 @@ Type* llvm_type2alive(const llvm::Type *ty) {
   case llvm::Type::VoidTyID:
     return &Type::voidTy;
   case llvm::Type::IntegerTyID:
-    return &get_int_type(cast<llvm::IntegerType>(ty)->getBitWidth());
+    return get_int_type(cast<llvm::IntegerType>(ty)->getBitWidth());
   case llvm::Type::HalfTyID:
     return &half_type;
   case llvm::Type::FloatTyID:
@@ -152,7 +157,7 @@ Type* llvm_type2alive(const llvm::Type *ty) {
     // 8 bits should be plenty to represent all unique values of this type
     // in the program
     if (strty->isOpaque())
-      return &get_int_type(8);
+      return get_int_type(8);
 
     auto &cache = type_cache[ty];
     if (!cache) {
@@ -241,7 +246,11 @@ Type* llvm_type2alive(const llvm::Type *ty) {
 
 
 Value* make_intconst(uint64_t val, int bits) {
-  auto c = make_unique<IntConst>(get_int_type(bits), val);
+  auto ty = get_int_type(bits);
+  if (!ty)
+    return nullptr;
+
+  auto c = make_unique<IntConst>(*ty, val);
   auto ret = c.get();
   current_fn->addConstant(std::move(c));
   return ret;
@@ -250,11 +259,13 @@ Value* make_intconst(uint64_t val, int bits) {
 IR::Value* make_intconst(const llvm::APInt &val) {
   unique_ptr<IntConst> c;
   auto bw = val.getBitWidth();
-  auto &ty = get_int_type(bw);
+  auto *ty = get_int_type(bw);
+  if (!ty)
+    return nullptr;
   if (bw <= 64)
-    c = make_unique<IntConst>(ty, val.getZExtValue());
+    c = make_unique<IntConst>(*ty, val.getZExtValue());
   else
-    c = make_unique<IntConst>(ty, toString(val, 10, false));
+    c = make_unique<IntConst>(*ty, toString(val, 10, false));
   auto ret = c.get();
   current_fn->addConstant(std::move(c));
   return ret;
@@ -285,6 +296,31 @@ Value* get_operand(llvm::Value *v,
   auto ty = llvm_type2alive(v->getType());
   if (!ty)
     return nullptr;
+
+  // automatic splat of constant values
+  if (auto vty = dyn_cast<llvm::FixedVectorType>(v->getType());
+      vty && isa<llvm::ConstantInt, llvm::ConstantFP>(v)) {
+    llvm::Value *llvm_splat = nullptr;
+    if (auto cnst = dyn_cast<llvm::ConstantInt>(v)) {
+      llvm_splat
+        = llvm::ConstantInt::get(vty->getElementType(), cnst->getValue());
+    } else if (auto cnst = dyn_cast<llvm::ConstantFP>(v)) {
+      llvm_splat
+        = llvm::ConstantFP::get(vty->getElementType(), cnst->getValue());
+    } else
+      UNREACHABLE();
+
+    auto splat = get_operand(llvm_splat, constexpr_conv, copy_inserter,
+                             register_fn_decl);
+    if (!splat)
+      return nullptr;
+
+    vector<Value*> vals(vty->getNumElements(), splat);
+    auto val = make_unique<AggregateValue>(*ty, std::move(vals));
+    auto ret = val.get();
+    current_fn->addConstant(std::move(val));
+    RETURN_CACHE(ret);
+  }
 
   if (auto cnst = dyn_cast<llvm::ConstantInt>(v)) {
     RETURN_CACHE(make_intconst(cnst->getValue()));
@@ -358,7 +394,7 @@ Value* get_operand(llvm::Value *v,
   if (auto fn = dyn_cast<llvm::Function>(v)) {
     auto val = make_unique<GlobalVariable>(
       *ty, '@' + fn->getName().str(), 0,
-      fn->getAlign().value_or(llvm::Align(8)).value(), true, true);
+      fn->getAlign().value_or(llvm::Align(8)).value(), true, true, true);
     auto gvar = val.get();
     current_fn->addConstant(std::move(val));
 
@@ -521,4 +557,13 @@ llvm::Function *findFunction(llvm::Module &M, const string &FName) {
   return F && !F->isDeclaration() ? F : nullptr;
 }
 
+TailCallInfo parse_fn_tailcall(const llvm::CallInst &i) {
+  bool is_tailcall = i.isTailCall() || i.isMustTailCall();
+  if (!is_tailcall)
+    return {};
+  auto tail_type =
+      i.isMustTailCall() ? TailCallInfo::MustTail : TailCallInfo::Tail;
+  bool has_same_cc = i.getCallingConv() == i.getCaller()->getCallingConv();
+  return {tail_type, has_same_cc};
+}
 }

@@ -11,6 +11,7 @@
 namespace llvm {
 class APInt;
 class BasicBlock;
+class CallInst;
 class ConstantExpr;
 class DataLayout;
 class Instruction;
@@ -37,7 +38,7 @@ IR::BasicBlock& getBB(const llvm::BasicBlock *bb);
 
 std::string value_name(const llvm::Value &v);
 
-IR::Type& get_int_type(unsigned bits);
+IR::Type* get_int_type(unsigned bits);
 IR::Type* llvm_type2alive(const llvm::Type *ty);
 
 IR::Value* make_intconst(uint64_t val, int bits);
@@ -69,4 +70,5 @@ std::unique_ptr<llvm::Module> openInputFile(llvm::LLVMContext &Context,
                                             const std::string &InputFilename);
 llvm::Function *findFunction(llvm::Module &M, const std::string &FName);
 
+IR::TailCallInfo parse_fn_tailcall(const llvm::CallInst &i);
 }

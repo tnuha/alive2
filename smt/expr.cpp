@@ -2,9 +2,8 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 #include "smt/expr.h"
-#include "smt/exprs.h"
 #include "smt/ctx.h"
-#include "smt/smt.h"
+#include "smt/exprs.h"
 #include "util/compiler.h"
 #include <algorithm>
 #include <bit>
@@ -12,15 +11,15 @@
 #include <climits>
 #include <limits>
 #include <memory>
-#include <string>
 #include <sstream>
+#include <string>
 #include <z3.h>
 
 #define DEBUG_Z3_RC 0
 #define WARN_MISSING_FOLDS 0
 
 #if DEBUG_Z3_RC || WARN_MISSING_FOLDS
-# include <iostream>
+#include <iostream>
 #endif
 
 using namespace smt;
@@ -29,13 +28,12 @@ using namespace util;
 
 // helpers to check if all input arguments are non-null
 #define C(...)                                                                 \
-  if (!isValid() || !expr::allValid( __VA_ARGS__))                             \
+  if (!isValid() || !expr::allValid(__VA_ARGS__)) [[unlikely]]                 \
     return {}
 
 #define C2(...)                                                                \
-  if (!expr::allValid(__VA_ARGS__))                                            \
+  if (!expr::allValid(__VA_ARGS__)) [[unlikely]]                               \
     return {}
-
 
 static Z3_sort mkBVSort(unsigned bits) {
   assert(bits > 0);
@@ -46,11 +44,13 @@ static Z3_ast mkVar(const char *name, Z3_sort sort) {
   return Z3_mk_const(smt::ctx(), Z3_mk_string_symbol(smt::ctx(), name), sort);
 }
 
-static expr simplify_const(expr &&e) { return e.simplifyNoTimeout(); }
+static expr simplify_const(expr &&e) {
+  return e.simplifyNoTimeout();
+}
 
 template <typename... Exprs>
 static expr simplify_const(expr &&e, const expr &input,
-                           const Exprs &... inputs) {
+                           const Exprs &...inputs) {
   if (input.isConst())
     return simplify_const(std::move(e), inputs...);
 
@@ -63,6 +63,9 @@ static expr simplify_const(expr &&e, const expr &input,
 }
 
 static bool is_power2(const expr &e, unsigned &log) {
+  if (!e.isConst())
+    return false;
+
   if (e.isZero() || !(e & (e - expr::mkUInt(1, e))).isZero())
     return false;
 
@@ -74,7 +77,6 @@ static bool is_power2(const expr &e, unsigned &log) {
   }
   UNREACHABLE();
 }
-
 
 namespace smt {
 
@@ -89,7 +91,7 @@ expr::expr(Z3_ast ast) noexcept : ptr((uintptr_t)ast) {
 
 bool expr::isZ3Ast() const {
   return true;
-  //return (ptr & 1) == 0;
+  // return (ptr & 1) == 0;
 }
 
 Z3_ast expr::ast() const {
@@ -220,7 +222,7 @@ expr expr::mkInt(const char *n, unsigned bits) {
   return bits ? Z3_mk_numeral(ctx(), n, mkBVSort(bits)) : expr();
 }
 
-static expr to_uf_float_sort(expr&& e) {
+static expr to_uf_float_sort(expr &&e) {
   if (get_uf_float() && e.isFloat())
     return e.float2BV();
   return e;
@@ -233,7 +235,7 @@ expr expr::mkFloat(double n, const expr &type) {
 
 expr expr::mkHalf(float n) {
   return to_uf_float_sort(
-    Z3_mk_fpa_numeral_float(ctx(), n, Z3_mk_fpa_sort_half(ctx())));
+      Z3_mk_fpa_numeral_float(ctx(), n, Z3_mk_fpa_sort_half(ctx())));
 }
 
 static Z3_sort mk_bfloat_sort() {
@@ -246,17 +248,17 @@ expr expr::mkBFloat(float n) {
 
 expr expr::mkFloat(float n) {
   return to_uf_float_sort(
-    Z3_mk_fpa_numeral_float(ctx(), n, Z3_mk_fpa_sort_single(ctx())));
+      Z3_mk_fpa_numeral_float(ctx(), n, Z3_mk_fpa_sort_single(ctx())));
 }
 
 expr expr::mkDouble(double n) {
   return to_uf_float_sort(
-    Z3_mk_fpa_numeral_double(ctx(), n, Z3_mk_fpa_sort_double(ctx())));
+      Z3_mk_fpa_numeral_double(ctx(), n, Z3_mk_fpa_sort_double(ctx())));
 }
 
 expr expr::mkQuad(double n) {
   return to_uf_float_sort(
-    Z3_mk_fpa_numeral_double(ctx(), n, Z3_mk_fpa_sort_quadruple(ctx())));
+      Z3_mk_fpa_numeral_double(ctx(), n, Z3_mk_fpa_sort_quadruple(ctx())));
 }
 
 expr expr::mkNaN(const expr &type) {
@@ -302,6 +304,15 @@ bool expr::isTernaryOp(expr &a, expr &b, expr &c, int z3op) const {
   return false;
 }
 
+expr expr::mkQVar(unsigned n, const expr &type) {
+  C2(type);
+  return Z3_mk_bound(ctx(), n, type.sort());
+}
+
+expr expr::mkQVar(unsigned n, unsigned bits) {
+  return Z3_mk_bound(ctx(), n, mkBVSort(bits));
+}
+
 expr expr::mkVar(const char *name, const expr &type) {
   C2(type);
   return ::mkVar(name, type.sort());
@@ -309,8 +320,7 @@ expr expr::mkVar(const char *name, const expr &type) {
 
 expr expr::mkVar(const char *name, unsigned bits, bool fresh) {
   auto sort = mkBVSort(bits);
-  return fresh ? Z3_mk_fresh_const(ctx(), name, sort)
-               : ::mkVar(name, sort);
+  return fresh ? Z3_mk_fresh_const(ctx(), name, sort) : ::mkVar(name, sort);
 }
 
 expr expr::mkBoolVar(const char *name) {
@@ -384,6 +394,11 @@ bool expr::isVar() const {
   if (auto app = isApp())
     return !isConst() && Z3_get_app_num_args(ctx(), app) == 0;
   return false;
+}
+
+bool expr::isQVar() const {
+  C();
+  return Z3_get_ast_kind(ctx(), ast()) == Z3_VAR_AST;
 }
 
 bool expr::isBV() const {
@@ -509,6 +524,10 @@ bool expr::isSignExt(expr &val) const {
   return isUnOp(val, Z3_OP_SIGN_EXT);
 }
 
+bool expr::isAShr(expr &a, expr &b) const {
+  return isBinOp(a, b, Z3_OP_BASHR);
+}
+
 bool expr::isAnd(expr &a, expr &b) const {
   return isBinOp(a, b, Z3_OP_AND);
 }
@@ -563,6 +582,7 @@ bool expr::isLambda(expr &body) const {
   }
   return false;
 }
+
 expr expr::lambdaIdxType() const {
   C();
   assert(Z3_get_quantifier_num_bound(ctx(), ast()) == 1);
@@ -594,11 +614,9 @@ bool expr::isFPNeg(expr &val) const {
       unsigned l;
       return a.isExtract(val, high, l) && b.isAllOnes() && b.bits() == 1;
     };
-    return isConcat(sign, rest) &&
-           sign.isBinOp(a, b, Z3_OP_BXOR) &&
+    return isConcat(sign, rest) && sign.isBinOp(a, b, Z3_OP_BXOR) &&
            (check_not(a, b) || check_not(b, a)) &&
-           rest.isExtract(val2, high2, low) &&
-           low == 0 && high2 == high - 1 &&
+           rest.isExtract(val2, high2, low) && low == 0 && high2 == high - 1 &&
            val.eq(val2);
   }
   return isUnOp(val, Z3_OP_FPA_NEG);
@@ -613,10 +631,8 @@ bool expr::isIsFPZero() const {
     // extract(bits()-2, 0) == 0
     expr lhs, rhs, v;
     unsigned high, low;
-    return isEq(lhs, rhs) &&
-           lhs.isExtract(v, high, low) &&
-           high == bits()-2 && low == 0 &&
-           rhs.isZero();
+    return isEq(lhs, rhs) && lhs.isExtract(v, high, low) &&
+           high == bits() - 2 && low == 0 && rhs.isZero();
   }
   return isAppOf(Z3_OP_FPA_IS_ZERO);
 }
@@ -674,8 +690,7 @@ expr expr::binop_commutative(const expr &rhs,
         if (app_b.isConst())
           return ((this->*expr_op)(app_b).*expr_op)(app_a);
       }
-    }
-    else if (rhs.isConst())
+    } else if (rhs.isConst())
       return rhs.binop_commutative(*this, op, expr_op, identity, absorvent,
                                    z3_app);
   }
@@ -684,19 +699,19 @@ expr expr::binop_commutative(const expr &rhs,
 }
 
 expr expr::binop_commutative(const expr &rhs,
-                             Z3_ast(*op)(Z3_context, Z3_ast, Z3_ast)) const {
+                             Z3_ast (*op)(Z3_context, Z3_ast, Z3_ast)) const {
   assert(!isValid() || !rhs.isValid() || sort() == rhs.sort());
   auto cmp = *this < rhs;
   return (cmp ? *this : rhs).binop_fold(cmp ? rhs : *this, op);
 }
 
 expr expr::binop_fold(const expr &rhs,
-                      Z3_ast(*op)(Z3_context, Z3_ast, Z3_ast)) const {
+                      Z3_ast (*op)(Z3_context, Z3_ast, Z3_ast)) const {
   C(rhs);
   return simplify_const(op(ctx(), ast(), rhs()), *this, rhs);
 }
 
-expr expr::unop_fold(Z3_ast(*op)(Z3_context, Z3_ast)) const {
+expr expr::unop_fold(Z3_ast (*op)(Z3_context, Z3_ast)) const {
   C();
   return simplify_const(op(ctx(), ast()), *this);
 }
@@ -740,7 +755,7 @@ expr expr::sdiv(const expr &rhs) const {
   if (rhs.isZero())
     return rhs;
 
-  if (isZero())
+  if (isZero() || rhs.isOne())
     return *this;
 
   if (isSMin() && rhs.isAllOnes())
@@ -756,7 +771,7 @@ expr expr::udiv(const expr &rhs) const {
   if (rhs.isZero())
     return rhs;
 
-  if (isZero())
+  if (isZero() || rhs.isOne())
     return *this;
 
   return binop_fold(rhs, Z3_mk_bvudiv);
@@ -796,17 +811,12 @@ expr expr::sadd_sat(const expr &rhs) const {
   auto bw = bits();
   auto min = IntSMin(bw);
   auto max = IntSMax(bw);
-  return mkIf(add_ext.sle(min.sext(1)),
-              min,
-              mkIf(add_ext.sge(max.sext(1)),
-                   max,
-                   *this + rhs));
+  return mkIf(add_ext.sle(min.sext(1)), min,
+              mkIf(add_ext.sge(max.sext(1)), max, *this + rhs));
 }
 
 expr expr::uadd_sat(const expr &rhs) const {
-  return mkIf(add_no_uoverflow(rhs),
-              *this + rhs,
-              IntUMax(bits()));
+  return mkIf(add_no_uoverflow(rhs), *this + rhs, IntUMax(bits()));
 }
 
 expr expr::ssub_sat(const expr &rhs) const {
@@ -814,18 +824,13 @@ expr expr::ssub_sat(const expr &rhs) const {
   auto bw = bits();
   auto min = IntSMin(bw);
   auto max = IntSMax(bw);
-  return mkIf(sub_ext.sle(min.sext(1)),
-              min,
-              mkIf(sub_ext.sge(max.sext(1)),
-                   max,
-                   *this - rhs));
+  return mkIf(sub_ext.sle(min.sext(1)), min,
+              mkIf(sub_ext.sge(max.sext(1)), max, *this - rhs));
 }
 
 expr expr::usub_sat(const expr &rhs) const {
   C();
-  return mkIf(rhs.uge(*this),
-              mkUInt(0, sort()),
-              *this - rhs);
+  return mkIf(rhs.uge(*this), mkUInt(0, sort()), *this - rhs);
 }
 
 expr expr::sshl_sat(const expr &rhs) const {
@@ -845,8 +850,7 @@ expr expr::add_no_soverflow(const expr &rhs) const {
 
   if (rhs.isConst()) {
     auto v = IntSMin(bits()) - rhs;
-    return rhs.isNegative().isTrue() ? sge(v)
-                                     : sle(v - mkUInt(1, rhs.sort()));
+    return rhs.isNegative().isTrue() ? sge(v) : sle(v - mkUInt(1, rhs.sort()));
   }
   if (isConst())
     return rhs.add_no_soverflow(*this);
@@ -890,7 +894,7 @@ expr expr::mul_no_soverflow(const expr &rhs) const {
 
 expr expr::mul_no_uoverflow(const expr &rhs) const {
   auto bw = bits();
-  return (zext(bw) * rhs.zext(bw)).extract(2*bw - 1, bw) == 0;
+  return (zext(bw) * rhs.zext(bw)).extract(2 * bw - 1, bw) == 0;
 }
 
 expr expr::sdiv_exact(const expr &rhs) const {
@@ -911,7 +915,7 @@ expr expr::operator<<(const expr &rhs) const {
     auto bw = bits();
     if (shift >= bw)
       return mkUInt(0, sort());
-    return extract(bw-shift-1, 0).concat(mkUInt(0, shift));
+    return extract(bw - shift - 1, 0).concat(mkUInt(0, shift));
   }
 
   return binop_fold(rhs, Z3_mk_bvshl);
@@ -934,7 +938,7 @@ expr expr::lshr(const expr &rhs) const {
     auto bw = bits();
     if (shift >= bw)
       return mkUInt(0, sort());
-    return mkUInt(0, shift).concat(extract(bw-1, shift));
+    return mkUInt(0, shift).concat(extract(bw - 1, shift));
   }
 
   return binop_fold(rhs, Z3_mk_bvlshr);
@@ -983,11 +987,9 @@ expr expr::smul_fix_no_soverflow(const expr &a, const expr &b, const expr &c) {
 }
 
 expr expr::smul_fix_sat(const expr &a, const expr &b, const expr &c) {
-  C2(a);
   expr r = smul_fix_helper(a, b, c);
   auto width = a.bits();
-  return mkIf(smul_fix_no_soverflow(a, b, c),
-              smul_fix(a, b, c),
+  return mkIf(smul_fix_no_soverflow(a, b, c), smul_fix(a, b, c),
               mkIf(r.isNegative(), IntSMin(width), IntSMax(width)));
 }
 
@@ -1013,8 +1015,7 @@ expr expr::umul_fix_no_uoverflow(const expr &a, const expr &b, const expr &c) {
 
 expr expr::umul_fix_sat(const expr &a, const expr &b, const expr &c) {
   auto width = a.bits();
-  return mkIf(umul_fix_no_uoverflow(a, b, c),
-              umul_fix(a, b, c),
+  return mkIf(umul_fix_no_uoverflow(a, b, c), umul_fix(a, b, c),
               IntUMax(width));
 }
 
@@ -1038,8 +1039,7 @@ static expr log2_rec(const expr &e, unsigned idx, unsigned bw) {
   if (idx == 0)
     return expr::mkUInt(0, bw);
 
-  return expr::mkIf(e.extract(idx, idx) == 1,
-                    expr::mkUInt(idx, bw),
+  return expr::mkIf(e.extract(idx, idx) == 1, expr::mkUInt(idx, bw),
                     log2_rec(e, idx - 1, bw));
 }
 
@@ -1141,18 +1141,29 @@ expr expr::round_up(const expr &power_of_two) const {
   return (*this + minus_1) & ~minus_1;
 }
 
-#define fold_fp_neg(fn)                                  \
-  do {                                                   \
-  expr cond, neg, v, v2;                                 \
-  if (isIf(cond, neg, v) && neg.isFPNeg(v2) && v.eq(v2)) \
-    return v.fn();                                       \
-} while (0)
+expr expr::round_up_bits(const expr &nbits) const {
+  C();
+  return round_up(mkUInt(1, *this) << nbits.zextOrTrunc(bits()));
+}
 
-static expr uf_float(const char *prefix, vector<expr> args,
-                     const expr &range, bool is_commutative = false) {
+expr expr::round_up_bits_no_overflow(const expr &nbits) const {
+  expr power_2 = mkUInt(1, *this) << nbits.zextOrTrunc(bits());
+  expr minus_1 = power_2 - mkUInt(1, power_2);
+  return add_no_uoverflow(minus_1);
+}
+
+#define fold_fp_neg(fn)                                                        \
+  do {                                                                         \
+    expr cond, neg, v, v2;                                                     \
+    if (isIf(cond, neg, v) && neg.isFPNeg(v2) && v.eq(v2))                     \
+      return v.fn();                                                           \
+  } while (0)
+
+static expr uf_float(const char *prefix, vector<expr> args, const expr &range,
+                     bool is_commutative = false) {
   ostringstream os;
   os << prefix;
-  for (const expr& arg : args) {
+  for (const expr &arg : args) {
     os << '.';
     arg.printSort(os);
   }
@@ -1185,7 +1196,7 @@ static expr uf_float(const char *prefix, vector<expr> args,
 expr expr::isNaN() const {
   if (get_uf_float())
     return uf_float("isNaN", {*this}, true);
-  
+
   fold_fp_neg(isNaN);
 
   expr v;
@@ -1198,7 +1209,7 @@ expr expr::isNaN() const {
 expr expr::isInf() const {
   if (get_uf_float())
     return uf_float("isInf", {*this}, true);
-  
+
   fold_fp_neg(isInf);
 
   expr v;
@@ -1210,7 +1221,7 @@ expr expr::isInf() const {
 
 expr expr::isFPZero() const {
   if (isBV())
-    return extract(bits()-2, 0) == 0;
+    return extract(bits() - 2, 0) == 0;
   if (get_uf_float())
     return uf_float("isFPZero", {*this}, true);
   return unop_fold(Z3_mk_fpa_is_zero);
@@ -1306,20 +1317,17 @@ expr expr::fabs() const {
 
 expr expr::fneg() const {
   if (isBV()) {
-    auto signbit = bits() - 1;
-    return (extract(signbit, signbit) ^ mkUInt(1, 1))
-             .concat(extract(signbit - 1, 0));
+    return (~sign()).concat(extract(bits() - 2, 0));
   }
 
   if (get_uf_float())
     return uf_float("fneg", {*this}, *this);
-  
+
   return unop_fold(Z3_mk_fpa_neg);
 }
 
 expr expr::copysign(const expr &sign) const {
-  auto sign_bit = sign.bits() - 1;
-  return sign.extract(sign_bit, sign_bit).concat(extract(bits() - 2, 0));
+  return sign.sign().concat(extract(bits() - 2, 0));
 }
 
 expr expr::sqrt(const expr &rm) const {
@@ -1327,6 +1335,39 @@ expr expr::sqrt(const expr &rm) const {
   if (get_uf_float())
     return uf_float("sqrt", {*this, rm}, *this);
   return simplify_const(Z3_mk_fpa_sqrt(ctx(), rm(), ast()), *this);
+}
+
+std::pair<expr, expr> expr::frexp() const {
+  C();
+  unsigned bits_exponent = Z3_fpa_get_ebits(ctx(), sort());
+  unsigned bits_mantissa = Z3_fpa_get_sbits(ctx(), sort()) - 1;
+  unsigned total_bits = bits_exponent + bits_mantissa + 1;
+
+  expr rm = expr::rne();
+  expr bv = float2BV();
+  unsigned bias = (1 << (bits_exponent - 1)) - 1;
+  expr sign = bv.sign();
+  expr exponent = bv.extract(total_bits - 2, bits_mantissa);
+  expr mantissa = bv.extract(bits_mantissa - 1, 0).zext(1);
+
+  expr subnormal = exponent == 0;
+  expr shift = mantissa.ctlz();
+
+  exponent = exponent.zextOrTrunc(32);
+  exponent = expr::mkIf(
+      isFPZero(), mkUInt(0, exponent),
+      expr::mkIf(subnormal, expr::mkInt(1 - bias, 32) - shift.sextOrTrunc(32),
+                 exponent + expr::mkInt(-bias, exponent)) +
+          expr::mkUInt(1, exponent));
+
+  expr restore_bit = expr::mkUInt(1, 1).concat_zeros(bits_mantissa);
+  mantissa = expr::mkIf(subnormal, mantissa << shift, mantissa | restore_bit);
+  expr shift2 = expr::mkUInt(1, 1).concat_zeros(bits_mantissa + 1);
+  mantissa = mantissa.uint2fp(*this, rm).fdiv(shift2.uint2fp(*this, rm), rm);
+  mantissa = expr::mkIf(isFPZero(), *this,
+                        expr::mkIf(sign == 0, mantissa, mantissa.fneg()));
+
+  return {std::move(mantissa), std::move(exponent)};
 }
 
 expr expr::fma(const expr &a, const expr &b, const expr &c, const expr &rm) {
@@ -1348,8 +1389,7 @@ expr expr::round(const expr &rm) const {
   C(rm);
   if (get_uf_float())
     return uf_float("round", {*this, rm}, *this);
-  return
-    simplify_const(Z3_mk_fpa_round_to_integral(ctx(), rm(), ast()), *this);
+  return simplify_const(Z3_mk_fpa_round_to_integral(ctx(), rm(), ast()), *this);
 }
 
 expr expr::foeq(const expr &rhs) const {
@@ -1438,7 +1478,7 @@ expr expr::operator&(const expr &rhs) const {
     if (!a.isUInt(n) || n == 0 || n == numeric_limits<uint64_t>::max())
       return expr();
 
-    auto lead  = countl_zero(n);
+    auto lead = countl_zero(n);
     auto trail = countr_zero(n);
 
     if (!is_power2((n >> trail) + 1))
@@ -1454,18 +1494,14 @@ expr expr::operator&(const expr &rhs) const {
   };
 
   if (bits() <= 64) {
-    if (auto f = fold_extract(*this, rhs);
-        f.isValid())
+    if (auto f = fold_extract(*this, rhs); f.isValid())
       return f;
-    if (auto f = fold_extract(rhs, *this);
-        f.isValid())
+    if (auto f = fold_extract(rhs, *this); f.isValid())
       return f;
 
     if (bits() == 1) {
-      if (auto a = get_bool(*this);
-          a.isValid())
-        if(auto b = get_bool(rhs);
-           b.isValid())
+      if (auto a = get_bool(*this); a.isValid())
+        if (auto b = get_bool(rhs); b.isValid())
           return (a && b).toBVBool();
     }
   }
@@ -1479,10 +1515,8 @@ expr expr::operator|(const expr &rhs) const {
     return rhs;
 
   if (bits() == 1) {
-    if (auto a = get_bool(*this);
-        a.isValid())
-      if (auto b = get_bool(rhs);
-        b.isValid())
+    if (auto a = get_bool(*this); a.isValid())
+      if (auto b = get_bool(rhs); b.isValid())
         return (a || b).toBVBool();
   }
 
@@ -1527,7 +1561,7 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
       return false;
     return rhs == *this;
   }
-  // constants on rhs from now.
+  // constants on rhs from now on.
 
   if (rhs.isTrue())
     return *this;
@@ -1547,8 +1581,7 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
     expr lhs_base, rhs_base;
     uint64_t lhs_offset, rhs_offset;
     if (isBasePlusOffset(lhs_base, lhs_offset) &&
-        rhs.isBasePlusOffset(rhs_base, rhs_offset) &&
-        lhs_base.eq(rhs_base) &&
+        rhs.isBasePlusOffset(rhs_base, rhs_offset) && lhs_base.eq(rhs_base) &&
         lhs_offset != rhs_offset)
       return false;
   }
@@ -1570,8 +1603,7 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
 
     // (concat ..) == (concat ..)
     if (auto app_rhs = rhs.isAppOf(Z3_OP_CONCAT);
-        app_rhs != nullptr &&
-        num_args == Z3_get_app_num_args(ctx(), app_rhs)) {
+        app_rhs != nullptr && num_args == Z3_get_app_num_args(ctx(), app_rhs)) {
       AndExpr eqs;
       bool all_aligned = true;
       unsigned l_idx = 0, r_idx = 0;
@@ -1592,14 +1624,13 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
           if (l_idx >= r_idx && l_idx < (r_idx + r_bits)) {
             unsigned overlap = min(r_bits - (l_idx - r_idx), l_bits);
             unsigned r_off = r_idx + r_bits - (l_idx + overlap);
-            eqs.add(lhs.extract(l_bits-1, l_bits - overlap) ==
+            eqs.add(lhs.extract(l_bits - 1, l_bits - overlap) ==
                     rhs.extract(r_off + overlap - 1, r_off));
-          }
-          else if (r_idx >= l_idx && r_idx < (l_idx + l_bits)) {
+          } else if (r_idx >= l_idx && r_idx < (l_idx + l_bits)) {
             unsigned overlap = min(l_bits - (r_idx - l_idx), r_bits);
             unsigned l_off = l_idx + l_bits - (r_idx + overlap);
             eqs.add(lhs.extract(l_off + overlap - 1, l_off) ==
-                    rhs.extract(r_bits-1, r_bits - overlap));
+                    rhs.extract(r_bits - 1, r_bits - overlap));
           }
         }
         l_idx += l_bits;
@@ -1625,8 +1656,7 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
       if ((rhs.isConst() && (t.isConst() || e.isConst())) ||
           (t.isConst() && e.isConst() && !rhs.isVar()))
         return mkIf(c, t == rhs, e == rhs);
-    }
-    else if (rhs.isAppOf(Z3_OP_ITE)) {
+    } else if (rhs.isAppOf(Z3_OP_ITE)) {
       return rhs == *this;
     }
   }
@@ -1636,8 +1666,7 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
     if (isAdd(a, b)) {
       // Pre: a >= 0, b >= 0, rhs u< b
       // a + b == rhs -> false
-      if (a.isNegative().isFalse() &&
-          b.isNegative().isFalse() &&
+      if (a.isNegative().isFalse() && b.isNegative().isFalse() &&
           (rhs.ult(a).isTrue() || rhs.ult(b).isTrue()))
         return false;
     }
@@ -1676,7 +1705,7 @@ expr expr::operator&&(const expr &rhs) const {
     return rhs;
 
   C(rhs);
-  Z3_ast args[] = { ast(), rhs() };
+  Z3_ast args[] = {ast(), rhs()};
   return Z3_mk_and(ctx(), 2, args);
 }
 
@@ -1687,20 +1716,18 @@ expr expr::operator||(const expr &rhs) const {
     return rhs;
 
   expr n;
-  if ((isNot(n) && n.eq(rhs)) ||
-      (rhs.isNot(n) && eq(n)))
+  if ((isNot(n) && n.eq(rhs)) || (rhs.isNot(n) && eq(n)))
     return true;
 
   // (a & b) | (!a & b) -> b
   expr a, b, c, d;
   if (isAnd(a, b) && rhs.isAnd(c, d) && b.eq(d)) {
-    if ((a.isNot(n) && n.eq(c)) ||
-        (c.isNot(n) && n.eq(a)))
+    if ((a.isNot(n) && n.eq(c)) || (c.isNot(n) && n.eq(a)))
       return b;
   }
 
   C(rhs);
-  Z3_ast args[] = { ast(), rhs() };
+  Z3_ast args[] = {ast(), rhs()};
   return Z3_mk_or(ctx(), 2, args);
 }
 
@@ -1710,6 +1737,14 @@ void expr::operator&=(const expr &rhs) {
 
 void expr::operator|=(const expr &rhs) {
   *this = *this || rhs;
+}
+
+expr expr::mk_and(const vector<expr> &vals) {
+  expr ret(true);
+  for (auto &e : vals) {
+    ret &= e;
+  }
+  return ret;
 }
 
 expr expr::mk_and(const set<expr> &vals) {
@@ -1807,43 +1842,42 @@ expr expr::sgt(const expr &rhs) const {
 }
 
 expr expr::ule(uint64_t rhs) const {
+  return ule(mkUInt(rhs, *this));
+}
+
+expr expr::ule_extend(uint64_t rhs) const {
   C();
-  return ule(mkUInt(rhs, sort()));
+  if ((unsigned)bit_width(rhs) > bits())
+    return true;
+  return ule(rhs);
 }
 
 expr expr::ult(uint64_t rhs) const {
-  C();
-  return ult(mkUInt(rhs, sort()));
+  return ult(mkUInt(rhs, *this));
 }
 
 expr expr::uge(uint64_t rhs) const {
-  C();
-  return uge(mkUInt(rhs, sort()));
+  return uge(mkUInt(rhs, *this));
 }
 
 expr expr::ugt(uint64_t rhs) const {
-  C();
-  return ugt(mkUInt(rhs, sort()));
+  return ugt(mkUInt(rhs, *this));
 }
 
 expr expr::sle(int64_t rhs) const {
-  C();
-  return sle(mkInt(rhs, sort()));
+  return sle(mkInt(rhs, *this));
 }
 
 expr expr::sge(int64_t rhs) const {
-  C();
-  return sge(mkInt(rhs, sort()));
+  return sge(mkInt(rhs, *this));
 }
 
 expr expr::operator==(uint64_t rhs) const {
-  C();
-  return *this == mkUInt(rhs, sort());
+  return *this == mkUInt(rhs, *this);
 }
 
 expr expr::operator!=(uint64_t rhs) const {
-  C();
-  return *this != mkUInt(rhs, sort());
+  return *this != mkUInt(rhs, *this);
 }
 
 expr expr::sext(unsigned amount) const {
@@ -1868,7 +1902,7 @@ expr expr::zext(unsigned amount) const {
 }
 
 expr expr::trunc(unsigned tobw) const {
-  return extract(tobw-1, 0);
+  return extract(tobw - 1, 0);
 }
 
 expr expr::sextOrTrunc(unsigned tobw) const {
@@ -1885,7 +1919,7 @@ expr expr::concat(const expr &rhs) const {
   expr a, b, c, d;
   unsigned h, l, h2, l2;
   if (isExtract(a, h, l)) {
-    if (rhs.isExtract(b, h2, l2) && l == h2+1) {
+    if (rhs.isExtract(b, h2, l2) && l == h2 + 1) {
       if (a.eq(b))
         return a.extract(h, l2);
 
@@ -1897,13 +1931,13 @@ expr expr::concat(const expr &rhs) const {
     }
 
     //  extract_l concat (concat extract_r foo)
-    if (rhs.isConcat(b, c) && b.isExtract(d, h2, l2) && l == h2+1 && a.eq(d))
+    if (rhs.isConcat(b, c) && b.isExtract(d, h2, l2) && l == h2 + 1 && a.eq(d))
       return a.extract(h, l2).concat(c);
   }
 
   // (concat (concat x extract) extract)
   if (isConcat(a, b) && b.isExtract(c, h, l) && rhs.isExtract(d, h2, l2) &&
-      l == h2+1 && c.eq(d))
+      l == h2 + 1 && c.eq(d))
     return a.concat(c.extract(h, l2));
 
   // (concat const (concat const2 x))
@@ -1921,7 +1955,7 @@ expr expr::extract(unsigned high, unsigned low, unsigned depth) const {
   C();
   assert(high >= low && high < bits());
 
-  if (low == 0 && high == bits()-1)
+  if (low == 0 && high == bits() - 1)
     return *this;
 
   if (depth-- == 0)
@@ -1944,6 +1978,14 @@ expr expr::extract(unsigned high, unsigned low, unsigned depth) const {
   }
   {
     expr a, b;
+    if (isAShr(a, b)) {
+      uint64_t shift;
+      if (b.isUInt(shift) && shift < a.bits() && high + shift < a.bits())
+        return a.extract(high + shift, low + shift);
+    }
+  }
+  {
+    expr a, b;
     if (isConcat(a, b)) {
       auto b_bw = b.bits();
       if (high < b_bw)
@@ -1953,7 +1995,7 @@ expr expr::extract(unsigned high, unsigned low, unsigned depth) const {
       if (low == 0)
         return a.extract(high - b_bw, 0).concat(b);
       if (a.isConst() || b.isConst())
-        return a.extract(high - b_bw, 0).concat(b.extract(b_bw-1, low));
+        return a.extract(high - b_bw, 0).concat(b.extract(b_bw - 1, low));
     }
   }
   {
@@ -1975,8 +2017,8 @@ expr expr::extract(unsigned high, unsigned low, unsigned depth) const {
         unsigned num_args = Z3_get_app_num_args(ctx(), app);
 
         for (unsigned i = 0; i < num_args; ++i) {
-          expr arg
-            = expr(Z3_get_app_arg(ctx(), app, i)).extract(high, low, depth);
+          expr arg =
+              expr(Z3_get_app_arg(ctx(), app, i)).extract(high, low, depth);
 
           // extract (op a b absorvent) -> absorvent
           if ((arg.*absorvent)())
@@ -2018,7 +2060,7 @@ expr expr::toBVBool() const {
 expr expr::float2BV() const {
   if (isBV())
     return *this;
-  
+
   if (auto app = isAppOf(Z3_OP_FPA_TO_FP)) // ((_ to_fp e s) BV)
     if (Z3_get_app_num_args(ctx(), app) == 1)
       return Z3_get_app_arg(ctx(), app, 0);
@@ -2033,8 +2075,8 @@ expr expr::float2Real() const {
 expr expr::BV2float(const expr &type) const {
   C(type);
   if (get_uf_float())
-    return *this; 
-  
+    return *this;
+
   if (auto app = isAppOf(Z3_OP_FPA_TO_IEEE_BV)) {
     expr arg = Z3_get_app_arg(ctx(), app, 0);
     if (arg.sort() == type.sort())
@@ -2078,9 +2120,8 @@ expr expr::uint2fp(const expr &type, const expr &rm) const {
   C(type, rm);
   if (get_uf_float())
     return uf_float("uint2fp", {*this, rm}, type);
-  return
-    simplify_const(Z3_mk_fpa_to_fp_unsigned(ctx(), rm(), ast(), type.sort()),
-                   *this);
+  return simplify_const(
+      Z3_mk_fpa_to_fp_unsigned(ctx(), rm(), ast(), type.sort()), *this);
 }
 
 expr expr::mkUF(const char *name, const vector<expr> &args, const expr &range) {
@@ -2097,8 +2138,8 @@ expr expr::mkUF(const char *name, const vector<expr> &args, const expr &range) {
     z3_sorts.emplace_back(arg.sort());
   }
 
-  auto decl = Z3_mk_func_decl(ctx(), Z3_mk_string_symbol(ctx(), name),
-                              num_args, z3_sorts.data(), range.sort());
+  auto decl = Z3_mk_func_decl(ctx(), Z3_mk_string_symbol(ctx(), name), num_args,
+                              z3_sorts.data(), range.sort());
   return Z3_mk_app(ctx(), decl, num_args, z3_args.data());
 }
 
@@ -2148,7 +2189,7 @@ expr expr::load(const expr &idx, uint64_t max_idx) const {
   } else if (isConstArray(val)) {
     return val;
   } else if (isLambda(val)) {
-    return val.subst({ idx }).foldTopLevel();
+    return val.subst_var(idx).foldTopLevel();
   }
 
   return Z3_mk_select(ctx(), ast(), idx());
@@ -2177,8 +2218,8 @@ expr expr::mkIf(const expr &cond, const expr &then, const expr &els) {
   expr lhs, rhs;
   // (ite (= x 1) 1 0) -> x
   // (ite (= x 1) 0 1) -> (not x)
-  if (then.isBV() && then.bits() == 1 && cond.isEq(lhs, rhs) &&
-      lhs.isBV() && lhs.bits() == 1) {
+  if (then.isBV() && then.bits() == 1 && cond.isEq(lhs, rhs) && lhs.isBV() &&
+      lhs.bits() == 1) {
     if (then.isOne() && els.isZero()) {
       if (lhs.isOne())
         return rhs;
@@ -2214,7 +2255,23 @@ expr expr::mkForAll(const set<expr> &vars, expr &&val) {
                             val());
 }
 
-expr expr::mkLambda(const expr &var, const expr &val) {
+expr expr::mkForAll(unsigned num_vars, const expr *vars, const char **names,
+                    expr &&val) {
+  if (num_vars == 0 || val.isConst() || !val.isValid())
+    return std::move(val);
+
+  const unsigned max_vars = 4;
+  ENSURE(num_vars <= max_vars);
+  Z3_sort sorts[max_vars];
+  Z3_symbol syms[max_vars];
+  for (unsigned i = 0; i < num_vars; ++i) {
+    sorts[i] = vars[i].sort();
+    syms[i] = Z3_mk_string_symbol(ctx(), names[i]);
+  }
+  return Z3_mk_forall(ctx(), 0, 0, nullptr, num_vars, sorts, syms, val());
+}
+
+expr expr::mkLambda(const expr &var, const char *var_name, const expr &val) {
   C2(var, val);
 
   if (!val.vars().count(var))
@@ -2224,8 +2281,9 @@ expr expr::mkLambda(const expr &var, const expr &val) {
   if (val.isLoad(array, idx) && idx.eq(var))
     return array;
 
-  auto ast = (Z3_app)var();
-  return Z3_mk_lambda_const(ctx(), 1, &ast, val());
+  auto sort = var.sort();
+  auto name = Z3_mk_string_symbol(ctx(), var_name);
+  return Z3_mk_lambda(ctx(), 1, &sort, &name, val());
 }
 
 expr expr::simplify() const {
@@ -2243,8 +2301,8 @@ expr expr::simplifyNoTimeout() const {
 expr expr::foldTopLevel() const {
   expr cond, then, els;
   if (isIf(cond, then, els))
-    return
-      expr::mkIf(cond.foldTopLevel(), then.foldTopLevel(), els.foldTopLevel());
+    return expr::mkIf(cond.foldTopLevel(), then.foldTopLevel(),
+                      els.foldTopLevel());
 
   expr array, idx;
   if (isLoad(array, idx) && idx.isConst())
@@ -2268,7 +2326,7 @@ expr expr::subst(const vector<pair<expr, expr>> &repls) const {
     return *this;
 
   auto from = make_unique<Z3_ast[]>(repls.size());
-  auto to   = make_unique<Z3_ast[]>(repls.size());
+  auto to = make_unique<Z3_ast[]>(repls.size());
 
   unsigned i = 0;
   for (auto &p : repls) {
@@ -2280,6 +2338,12 @@ expr expr::subst(const vector<pair<expr, expr>> &repls) const {
   return Z3_substitute(ctx(), ast(), repls.size(), from.get(), to.get());
 }
 
+expr expr::subst_simplify(const vector<pair<expr, expr>> &repls) const {
+  if (repls.empty())
+    return *this;
+  return subst(repls).simplify();
+}
+
 expr expr::subst(const expr &from, const expr &to) const {
   C(from, to);
   auto f = from();
@@ -2287,25 +2351,31 @@ expr expr::subst(const expr &from, const expr &to) const {
   return Z3_substitute(ctx(), ast(), 1, &f, &t);
 }
 
-expr expr::subst(const vector<expr> &repls) const {
-  C();
-  if (repls.empty())
-    return *this;
+expr expr::subst_var(const expr &repl) const {
+  C(repl);
+  auto r = repl();
+  return Z3_substitute_vars(ctx(), ast(), 1, &r);
+}
 
-  unique_ptr<Z3_ast[]> vars(new Z3_ast[repls.size()]);
+expr expr::propagate(const AndExpr &constraints) const {
+  C();
+  auto from = make_unique<Z3_ast[]>(constraints.exprs.size());
+  auto to = make_unique<Z3_ast[]>(constraints.exprs.size());
+  expr true_expr(true);
   unsigned i = 0;
-  for (auto &v : repls) {
-    C2(v);
-    vars[i++] = v();
+  for (auto &e : constraints.exprs) {
+    C2(e);
+    from[i] = e();
+    to[i++] = true_expr();
   }
-  return Z3_substitute_vars(ctx(), ast(), repls.size(), vars.get());
+  return Z3_substitute(ctx(), ast(), i, from.get(), to.get());
 }
 
 set<expr> expr::vars() const {
-  return vars({ this });
+  return vars({this});
 }
 
-set<expr> expr::vars(const vector<const expr*> &exprs) {
+set<expr> expr::vars(const vector<const expr *> &exprs) {
   set<expr> result;
   vector<Z3_ast> todo;
   unordered_set<Z3_ast> seen;
@@ -2323,6 +2393,9 @@ set<expr> expr::vars(const vector<const expr*> &exprs) {
 
     switch (Z3_get_ast_kind(ctx(), ast)) {
     case Z3_VAR_AST:
+      result.emplace(expr(ast));
+      break;
+
     case Z3_NUMERAL_AST:
       break;
 
@@ -2362,7 +2435,7 @@ set<expr> expr::vars(const vector<const expr*> &exprs) {
 
 set<expr> expr::leafs(unsigned max) const {
   C();
-  vector<expr> worklist = { *this };
+  vector<expr> worklist = {*this};
   unordered_set<Z3_ast> seen;
   set<expr> ret;
   do {
@@ -2371,7 +2444,7 @@ set<expr> expr::leafs(unsigned max) const {
     if (!seen.emplace(val()).second)
       continue;
 
-    expr cond, then, els, e;
+    expr cond, then, els, e, array, idx;
     unsigned high, low;
     if (val.isIf(cond, then, els)) {
       worklist.emplace_back(std::move(then));
@@ -2379,6 +2452,16 @@ set<expr> expr::leafs(unsigned max) const {
     } else if (val.isExtract(e, high, low) && e.isIf(cond, then, els)) {
       worklist.emplace_back(then.extract(high, low));
       worklist.emplace_back(els.extract(high, low));
+    } else if (val.isLoad(array, idx)) {
+      if (array.isStore(array, idx, e)) {
+        worklist.emplace_back(array.load(idx));
+        worklist.emplace_back(std::move(e));
+      } else if (array.isIf(cond, then, els)) {
+        worklist.emplace_back(then.load(idx));
+        worklist.emplace_back(els.load(idx));
+      } else {
+        ret.emplace(std::move(val));
+      }
     } else {
       ret.emplace(std::move(val));
     }
@@ -2395,7 +2478,7 @@ set<expr> expr::leafs(unsigned max) const {
 
 set<expr> expr::get_apps_of(const char *fn_name, const char *prefix) const {
   C();
-  vector<expr> worklist = { *this };
+  vector<expr> worklist = {*this};
   unordered_set<Z3_ast> seen;
   set<expr> ret;
   do {
@@ -2439,12 +2522,16 @@ void expr::printSort(ostream &os) const {
   os << Z3_sort_to_string(ctx(), sort());
 }
 
-string expr::numeral_string() const {
+void expr::printSort(ostream &os) const {
+  os << Z3_sort_to_string(ctx(), sort());
+}
+
+string_view expr::numeral_string() const {
   C();
   return Z3_get_numeral_decimal_string(ctx(), ast(), 12);
 }
 
-string expr::fn_name() const {
+string_view expr::fn_name() const {
   if (isApp())
     return Z3_get_symbol_string(ctx(), Z3_get_decl_name(ctx(), decl()));
   return {};
@@ -2462,7 +2549,7 @@ expr expr::getFnArg(unsigned i) const {
   return Z3_get_app_arg(ctx(), app, i);
 }
 
-ostream& operator<<(ostream &os, const expr &e) {
+ostream &operator<<(ostream &os, const expr &e) {
   return os << (e.isValid() ? Z3_ast_to_string(ctx(), e()) : "(null)");
 }
 
@@ -2474,11 +2561,13 @@ strong_ordering expr::operator<=>(const expr &rhs) const {
 }
 
 unsigned expr::id() const {
+  C();
   return Z3_get_ast_id(ctx(), ast());
 }
 
 unsigned expr::hash() const {
+  C();
   return Z3_get_ast_hash(ctx(), ast());
 }
 
-}
+} // namespace smt

@@ -2,12 +2,15 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 #include "ir/attrs.h"
+#include "ir/function.h"
 #include "ir/globals.h"
+#include "ir/instr.h"
 #include "ir/memory.h"
 #include "ir/state.h"
 #include "ir/state_value.h"
 #include "ir/type.h"
 #include "util/compiler.h"
+#include <algorithm>
 #include <cassert>
 
 using namespace std;
@@ -52,8 +55,25 @@ ostream& operator<<(ostream &os, const ParamAttrs &attr) {
     os << "allocalign ";
   if (attr.has(ParamAttrs::DeadOnUnwind))
     os << "dead_on_unwind ";
+  if (attr.has(ParamAttrs::DeadOnReturn)) {
+    os << "dead_on_return";
+    if (attr.deadOnReturnBytes.has_value())
+      os << '(' << *attr.deadOnReturnBytes << ')';
+    os << ' ';
+  }
   if (attr.has(ParamAttrs::Writable))
     os << "writable ";
+  if (!attr.initializes.empty()) {
+    os << "initializes(";
+    bool first = true;
+    for (auto [low, high] : attr.initializes) {
+      if (!first)
+        os << ", ";
+      first = false;
+      os << '(' << low << ", " << high << ')';
+    }
+    os << ") ";
+  }
   return os;
 }
 
@@ -323,7 +343,8 @@ bool ParamAttrs::poisonImpliesUB() const {
          has(Dereferenceable) ||
          has(DereferenceableOrNull) ||
          has(NoUndef) ||
-         has(Writable);
+         has(Writable) ||
+         !initializes.empty();
 }
 
 uint64_t ParamAttrs::getDerefBytes() const {
@@ -340,6 +361,9 @@ uint64_t ParamAttrs::maxAccessSize() const {
   uint64_t bytes = getDerefBytes();
   if (has(ParamAttrs::DereferenceableOrNull))
     bytes = max(bytes, derefOrNullBytes);
+  for (auto [low, high] : initializes) {
+    bytes = max(bytes, high);
+  }
   return round_up(bytes, align);
 }
 
@@ -349,13 +373,17 @@ void ParamAttrs::merge(const ParamAttrs &other) {
   derefOrNullBytes = max(derefOrNullBytes, other.derefOrNullBytes);
   blockSize        = max(blockSize, other.blockSize);
   align            = max(align, other.align);
+
+  decltype(initializes) tmp;
+  ranges::set_union(initializes, other.initializes, std::back_inserter(tmp));
+  initializes = std::move(tmp);
 }
 
 static expr
 encodePtrAttrs(State &s, const expr &ptrvalue, uint64_t derefBytes,
                uint64_t derefOrNullBytes, uint64_t align, bool nonnull,
                bool nocapture, bool writable, const expr &allocsize,
-               Value *allocalign, bool isdecl) {
+               Value *allocalign, bool isdecl, bool isret) {
   auto &m = s.getMemory();
   Pointer p(m, ptrvalue);
   expr non_poison(true);
@@ -365,8 +393,10 @@ encodePtrAttrs(State &s, const expr &ptrvalue, uint64_t derefBytes,
 
   non_poison &= p.isNocapture().implies(nocapture);
 
+  // dereferenceable, byval (ParamAttrs), dereferenceable_or_null
   if (derefBytes || derefOrNullBytes || allocsize.isValid()) {
-    // dereferenceable, byval (ParamAttrs), dereferenceable_or_null
+    if (isret)
+      s.addUB(!p.isStackAllocated());
     if (derefBytes)
       s.addUB(merge(p.isDereferenceable(derefBytes, align, writable, true)));
     if (derefOrNullBytes)
@@ -379,8 +409,8 @@ encodePtrAttrs(State &s, const expr &ptrvalue, uint64_t derefBytes,
   } else if (align != 1) {
     non_poison &= p.isAligned(align);
     if (isdecl)
-      s.addUB(merge(p.isDereferenceable(1, 1, false, true))
-                .implies(merge(p.isDereferenceable(1, align, false, true))));
+      s.addAxiom(merge(p.isDereferenceable(1, 1, false, true))
+                   .implies(merge(p.isDereferenceable(1, align, false, true))));
   }
 
   if (allocalign) {
@@ -404,11 +434,18 @@ StateValue ParamAttrs::encode(State &s, StateValue &&val, const Type &ty,
     val.non_poison &= !isfpclass(val.value, ty, nofpclass);
   }
 
-  if (ty.isPtrType())
+  if (ty.isPtrType()) {
     val.non_poison &=
       encodePtrAttrs(s, val.value, getDerefBytes(), derefOrNullBytes, align,
-                     has(NonNull), has(NoCapture), has(Writable), {}, nullptr,
-                     isdecl);
+                     has(NonNull), has(NoCapture) || has(ByVal), has(Writable),
+                     {}, nullptr, isdecl, false);
+
+    if (!initializes.empty()) {
+      Pointer p(s.getMemory(), val.value);
+      uint64_t high = initializes.back().second;
+      s.addUB(p.addNoUSOverflow(expr::mkUInt(high, bits_for_offset), false));
+    }
+  }
 
   if (poisonImpliesUB()) {
     s.addUB(std::move(val.non_poison));
@@ -511,7 +548,8 @@ StateValue FnAttrs::encode(State &s, StateValue &&val, const Type &ty,
   if (ty.isPtrType())
     val.non_poison &=
       encodePtrAttrs(s, val.value, derefBytes, derefOrNullBytes, align,
-                     has(NonNull), false, false, allocsize, allocalign, false);
+                     has(NonNull), false, false, allocsize, allocalign, false,
+                     true);
 
   if (poisonImpliesUB()) {
     s.addUB(std::move(val.non_poison));
@@ -617,6 +655,94 @@ ostream& operator<<(std::ostream &os, FpExceptionMode ex) {
   case FpExceptionMode::Strict:  str = "strict"; break;
   }
   return os << str;
+}
+
+ostream& operator<<(std::ostream &os, const TailCallInfo &tci) {
+  const char *str = nullptr;
+  switch (tci.type) {
+    case TailCallInfo::None:     str = ""; break;
+    case TailCallInfo::Tail:     str = "tail "; break;
+    case TailCallInfo::MustTail: str = "musttail "; break;
+  }
+  return os << str;
+}
+
+void TailCallInfo::check(State &s, const Instr &i,
+                         const vector<PtrInput> &args) const {
+  if (type == TailCallInfo::None)
+    return;
+
+  // Cannot access allocas, va_args, or byval arguments from the caller.
+  // Exception: alloca or byval arg may be passed to the callee as byval
+  for (const auto &arg : args) {
+    Pointer ptr(s.getMemory(), arg.val.value);
+    // if the ptr is poison, it can be replaced by an alloca
+    s.addUB(arg.val.non_poison &&
+      (ptr.isStackAllocated() || ptr.isByval()).implies(arg.byval != 0) &&
+      true // TODO: check for !var_args
+    );
+  }
+
+  if (type != TailCallInfo::MustTail)
+    return;
+
+  // additional rules for musttail
+
+  auto *call = dynamic_cast<const FnCall*>(&i);
+
+  // - The call must immediately precede a ret instruction, or a bitcast
+  // - The ret instruction must return the (possibly bitcasted) value produced
+  // by the call, undef/poison, or void.
+
+  bool found_instr = false, found_ret = false;
+  const Value *val = &i;
+  for (auto &instr : s.getFn().bbOf(i).instrs()) {
+    if (&instr == val) {
+      assert(!found_instr);
+      found_instr = true;
+      continue;
+    }
+
+    if (found_instr) {
+      if (auto *cast = isCast(ConversionOp::BitCast, instr)) {
+        if (&cast->getValue() != val) {
+          s.addUB(expr(false));
+          return;
+        }
+        val = cast;
+        continue;
+      }
+      if (auto *ret = dynamic_cast<const Return*>(&instr)) {
+        found_ret = true;
+        if (ret->getType().isVoid() && i.getType().isVoid())
+          break;
+        auto *ret_val = ret->operands()[0];
+        if (dynamic_cast<UndefValue*>(ret_val) ||
+            dynamic_cast<PoisonValue*>(ret_val) ||
+            ret_val == val)
+          break;
+      }
+      s.addUB(expr(false));
+    }
+  }
+  ENSURE(found_instr);
+  if (!found_ret)
+    s.addUB(expr(false));
+
+  // The calling conventions of the caller and callee must match.
+  if (!has_same_calling_convention)
+    s.addUB(expr(false));
+
+  // The callee must be varargs iff the caller is varargs.
+  if (call) {
+    bool callee_is_vararg = call->getVarArgIdx() != -1u;
+    bool caller_is_vararg = s.getFn().isVarArgs();
+    if (callee_is_vararg && !caller_is_vararg)
+      s.addUB(expr(false));
+  }
+
+  // TODO:
+  // - The return type must not undergo automatic conversion to an sret pointer.
 }
 
 }

@@ -32,6 +32,10 @@ unsigned Type::np_bits(bool fromInt) const {
   return min(bw, (unsigned)divide_up(bw * bits_poison_per_byte, bits_byte));
 }
 
+unsigned Type::maxSubBitAccess() const {
+  return 0;
+}
+
 expr Type::var(const char *var, unsigned bits) const {
   auto str = name + '_' + var;
   return expr::mkVar(str.c_str(), bits);
@@ -462,7 +466,7 @@ expr FloatType::fromFloat(State &s, const expr &fp, const Type &from_type0,
   ChoiceExpr<expr> exprs;
 
   // 1) preferred QNaN (1000..00)
-  exprs.add(expr::mkUInt(1ull << (fraction_bits-1), fraction_bits), expr(true));
+  exprs.add(expr::mkUInt(1, 1).concat_zeros(fraction_bits-1), expr(true));
 
   // 2) input NaN
   // 3) quieted input NaN
@@ -886,6 +890,13 @@ unsigned AggregateType::np_bits(bool fromInt) const {
   return bw;
 }
 
+unsigned AggregateType::maxSubBitAccess() const {
+  return std::accumulate(children.begin(), children.end(), 0,
+            [](unsigned acc, const Type *t) {
+              return max(acc, t->maxSubBitAccess());
+            });
+}
+
 StateValue AggregateType::getDummyValue(bool non_poison) const {
   vector<StateValue> vals;
   for (unsigned i = 0; i < elements; ++i) {
@@ -1150,6 +1161,10 @@ expr VectorType::getTypeConstraints() const {
   return r;
 }
 
+unsigned VectorType::maxSubBitAccess() const {
+  return elements * children[0]->maxSubBitAccess();
+}
+
 expr VectorType::scalarSize() const {
   return children[0]->sizeVar();
 }
@@ -1278,24 +1293,24 @@ expr SymbolicType::scalarSize() const {
   DISPATCH_EXPR(scalarSize());
 }
 
-expr SymbolicType::operator==(const Type &b) const {
-  if (this == &b)
+expr SymbolicType::operator==(const Type &t) const {
+  if (this == &t)
     return true;
 
-  if (auto rhs = dynamic_cast<const IntType*>(&b))
+  if (auto rhs = dynamic_cast<const IntType*>(&t))
     return isInt() && (i ? *i == *rhs : false);
-  if (auto rhs = dynamic_cast<const FloatType*>(&b))
+  if (auto rhs = dynamic_cast<const FloatType*>(&t))
     return isFloat() && (f ? *f == *rhs : false);
-  if (auto rhs = dynamic_cast<const PtrType*>(&b))
+  if (auto rhs = dynamic_cast<const PtrType*>(&t))
     return isPtr() && (p ? *p == *rhs : false);
-  if (auto rhs = dynamic_cast<const ArrayType*>(&b))
+  if (auto rhs = dynamic_cast<const ArrayType*>(&t))
     return isArray() && (a ? *a == *rhs : false);
-  if (auto rhs = dynamic_cast<const VectorType*>(&b))
+  if (auto rhs = dynamic_cast<const VectorType*>(&t))
     return isVector() && (v ? *v == *rhs : false);
-  if (auto rhs = dynamic_cast<const StructType*>(&b))
+  if (auto rhs = dynamic_cast<const StructType*>(&t))
     return isStruct() && (s ? *s == *rhs : false);
 
-  if (auto rhs = dynamic_cast<const SymbolicType*>(&b)) {
+  if (auto rhs = dynamic_cast<const SymbolicType*>(&t)) {
     expr c(false);
     if (i && rhs->i) c |= isInt()    && *i == *rhs->i;
     if (f && rhs->f) c |= isFloat()  && *f == *rhs->f;

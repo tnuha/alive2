@@ -29,12 +29,16 @@ public:
   void add(expr &&e, unsigned limit = 16);
   void add(const AndExpr &other);
   void del(const AndExpr &other);
+  expr propagate(const AndExpr &other) const;
   void reset();
   bool contains(const expr &e) const;
   expr operator()() const;
   operator bool() const;
   bool isTrue() const { return exprs.empty(); }
+  auto operator<=>(const AndExpr&) const = default;
   friend std::ostream &operator<<(std::ostream &os, const AndExpr &e);
+  template<typename T> friend class DisjointExpr;
+  friend class expr;
 };
 
 
@@ -47,6 +51,7 @@ public:
   void add(const OrExpr &other);
   expr operator()() const;
   bool empty() const { return exprs.empty(); }
+  auto operator<=>(const OrExpr&) const = default;
   friend std::ostream &operator<<(std::ostream &os, const OrExpr &e);
 };
 
@@ -120,6 +125,8 @@ public:
   }
 
   std::optional<T> operator()() && { return std::move(*this).mk({}); }
+
+  T factor() const;
 
   expr domain() const {
     OrExpr ret;
@@ -209,6 +216,8 @@ public:
   void add(const expr &key, expr &&val);
   void add(const FunctionExpr &other);
 
+  void replace(const expr &key, expr &&val);
+
   std::optional<expr> operator()(const expr &key) const;
   const expr* lookup(const expr &key) const;
 
@@ -217,6 +226,9 @@ public:
   auto begin() const { return fn.begin(); }
   auto end() const { return fn.end(); }
   bool empty() const { return fn.empty(); }
+
+  static FunctionExpr mkIf(const expr &cond, const FunctionExpr &then,
+                           const FunctionExpr &els);
 
   auto operator<=>(const FunctionExpr &rhs) const = default;
 

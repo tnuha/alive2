@@ -5,6 +5,8 @@
 
 #include <cassert>
 #include <cstdint>
+#include <string_view>
+#include <utility>
 
 #ifdef _MSC_VER
 # define UNREACHABLE() __assume(0)
@@ -42,6 +44,20 @@ struct const_strip_unique_ptr {
   const_iterator end() const   { return container.end(); }
 };
 
+template <typename T>
+class TmpValueChange {
+  T &ref;
+  T old_value;
+
+public:
+  TmpValueChange(T &ref, T new_val) : ref(ref), old_value(std::move(ref)) {
+    ref = std::move(new_val);
+  }
+  ~TmpValueChange() {
+    ref = std::move(old_value);
+  }
+};
+
 unsigned ilog2(uint64_t n);
 // if up_power2 is true, then we do +1 for powers of 2
 // e.g. ilog2_ceil(8, false) = 3 ; ilog2_ceil(8, true) = 4
@@ -54,5 +70,8 @@ uint64_t mul_saturate(uint64_t a, uint64_t b);
 
 uint64_t divide_up(uint64_t n, uint64_t amount); // division with ceiling
 uint64_t round_up(uint64_t n, uint64_t amount);
+
+bool stricontains(const std::string_view &needle,
+                  const std::string_view &haystack);
 
 }

@@ -86,11 +86,13 @@ class GlobalVariable final : public Value {
   unsigned align;
   bool isconst;
   bool arbitrary_size;
+  bool is_function;
 public:
   GlobalVariable(Type &type, std::string &&name, uint64_t allocsize,
-                 unsigned align, bool isconst, bool arbitrary_size) :
+                 unsigned align, bool isconst, bool arbitrary_size,
+                 bool is_function = false) :
     Value(type, std::move(name)), allocsize(allocsize), align(align),
-    isconst(isconst), arbitrary_size(arbitrary_size) {}
+    isconst(isconst), arbitrary_size(arbitrary_size), is_function(is_function) {}
   uint64_t size() const { return allocsize; }
   bool isArbitrarySize() const { return arbitrary_size; }
   unsigned getAlignment() const { return align; }
@@ -129,7 +131,7 @@ public:
   StateValue toSMT(State &s) const override;
   smt::expr getUndefVar(const Type &ty, unsigned child) const;
 
-  static bool isUndefMask(const smt::expr &e, const smt::expr &var);
+  static bool isUndefMask(const smt::expr &e);
 };
 
 }

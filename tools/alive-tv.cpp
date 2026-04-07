@@ -17,6 +17,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/InitLLVM.h"
@@ -125,6 +126,11 @@ and "tgt5" will unused.
 #define ARGS_MODULE_VAR M1
 # include "llvm_util/cmd_args_def.h"
 
+  if (llvm::verifyModule(*M1.get(), &llvm::errs())) {
+    *out << "Source file is broken\n";
+    return -1;
+  }
+
   auto &DL = M1.get()->getDataLayout();
   llvm::Triple targetTriple(M1.get()->getTargetTriple());
   llvm::TargetLibraryInfoWrapperPass TLI(targetTriple);
@@ -132,7 +138,6 @@ and "tgt5" will unused.
   llvm_util::initializer llvm_util_init(*out, DL);
   smt::smt_initializer smt_init;
   Verifier verifier(TLI, smt_init, *out);
-  verifier.quiet = opt_quiet;
   verifier.always_verify = opt_always_verify;
   verifier.print_dot = opt_print_dot;
   verifier.bidirectional = opt_bidirectional;
@@ -177,7 +182,7 @@ and "tgt5" will unused.
     }
     if (Cnt == 0) {
       M2 = CloneModule(*M1);
-      auto err = optimize_module(M2.get(), optPass);
+      auto err = optimize_module(*M2.get(), optPass);
       if (!err.empty()) {
         *out << "Error parsing list of LLVM passes: " << err << '\n';
         return -1;
@@ -197,6 +202,11 @@ and "tgt5" will unused.
 
   if (M1.get()->getTargetTriple() != M2.get()->getTargetTriple()) {
     *out << "Modules have different target triples\n";
+    return -1;
+  }
+
+  if (llvm::verifyModule(*M2.get(), &llvm::errs())) {
+    *out << "Target file is broken\n";
     return -1;
   }
 

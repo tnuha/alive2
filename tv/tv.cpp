@@ -17,7 +17,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Plugins/PassPlugin.h"
 #include "llvm/TargetParser/Triple.h"
 #include <fstream>
 #include <iostream>
@@ -61,6 +61,10 @@ llvm::cl::opt<long> subprocess_timeout("tv-subprocess-timeout",
 
 llvm::cl::opt<bool> batch_opts("tv-batch-opts",
   llvm::cl::desc("Batch optimizations (clang plugin only)"),
+  llvm::cl::cat(alive_cmdargs));
+
+llvm::cl::opt<string> check_only_pass("tv-check-pass",
+  llvm::cl::desc("Check only the specified LLVM optimization pass"),
   llvm::cl::cat(alive_cmdargs));
 
 
@@ -248,12 +252,12 @@ struct TVLegacyPass final : public llvm::ModulePass {
     if (!opt_always_verify) {
       // Compare Alive2 IR and skip if syntactically equal
       if (src_tostr == tgt_tostr) {
-        if (!opt_quiet) {
+        if (!config::quiet) {
           TransformPrintOpts print_opts;
           print_opts.skip_tgt = true;
           t.print(*out, print_opts);
+          *out << "Transformation seems to be correct! (syntactically equal)\n\n";
         }
-        *out << "Transformation seems to be correct! (syntactically equal)\n\n";
         return;
       }
     }
@@ -262,7 +266,8 @@ struct TVLegacyPass final : public llvm::ModulePass {
     // to do this before forking. Anyway, this is fast.
     if (opt_assume_cache_hit ||
         (cache && cache->lookup(src_tostr + "===\n" + tgt_tostr))) {
-      *out << "Skipping repeated query\n\n";
+      if (!config::quiet)
+        *out << "Skipping repeated query\n\n";
       return;
     }
 
@@ -311,12 +316,14 @@ struct TVLegacyPass final : public llvm::ModulePass {
     smt_init->reset();
     t.preprocess();
     TransformVerify verifier(t, false);
-    if (!opt_quiet)
+    if (!config::quiet)
       t.print(*out);
 
     {
       auto types = verifier.getTypings();
       if (!types) {
+        if (config::quiet)
+          t.print(*out);
         *out << "Transformation doesn't verify!\n"
                 "ERROR: program doesn't type check!\n\n";
         goto done;
@@ -330,20 +337,23 @@ struct TVLegacyPass final : public llvm::ModulePass {
         errs.printWarnings(*out);
 
       if (errs) {
+        if (config::quiet)
+          t.print(*out);
+
         *out << "Transformation doesn't verify!" <<
                 (errs.isUnsound() ? " (unsound)\n" : " (not unsound)\n")
-            << errs;
+             << errs
+             << "\nPass: " << pass_name << '\n';
+        emitCommandLine(out);
+        *out << '\n';
         if (errs.isUnsound()) {
-          has_failure = true;
-          *out << "\nPass: " << pass_name << '\n';
-          emitCommandLine(out);
           if (!SavedBitcode.empty())
             writeBitcode(report_filename);
-          *out << "\n";
+          has_failure = true;
         }
         if (opt_error_fatal && has_failure)
           finalize();
-      } else {
+      } else if (!config::quiet) {
         *out << "Transformation seems to be correct!\n\n";
       }
     }
@@ -513,7 +523,8 @@ const char* nop_pass_prefixes[] {
 };
 
 const char* terminate_execution[] {
-  "RequireAnalysisPass<GlobalsAA, Module>",
+  "RequireAnalysisPass<llvm::GlobalsAA",
+  "RequireAnalysisPass<GlobalsAA",
 };
 
 bool is_unsupported_pass(const llvm::StringRef &pass0) {
@@ -616,24 +627,31 @@ struct TVPass : public llvm::PassInfoMixin<TVPass> {
       bool unsupported = is_unsupported_pass(pass_name);
       bool nop = is_nop_pass(pass_name);
       bool terminate = is_terminate_pass(pass_name);
+      bool check_skip = !check_only_pass.empty() &&
+                        !stricontains(pass_name, check_only_pass);
 
       static unsigned count = 0;
 
-      *out << "-- " << ++count << ". " << pass_name;
-      if (unsupported)
-        *out << " : Skipping unsupported\n";
-      else if (terminate)
-        *out << " : Global pass. Cannot continue verification\n";
-      else if (nop)
-        *out << " : Skipping NOP\n";
-      else
-        *out << '\n';
+      if (!config::quiet) {
+        *out << "-- " << ++count << ". " << pass_name;
+
+        if (unsupported)
+          *out << " : Skipping unsupported\n";
+        else if (terminate)
+          *out << " : Global pass. Cannot continue verification\n";
+        else if (nop)
+          *out << " : Skipping NOP\n";
+        else if (check_skip)
+          *out << " : Skip this pass per user request\n";
+        else
+          *out << '\n';
+      }
 
       if ((dont_verify |= terminate))
         return;
 
       TVLegacyPass tv;
-      tv.unsupported_transform = unsupported;
+      tv.unsupported_transform = unsupported || check_skip;
       tv.nop_transform = nop;
 
       tv.TLI_override = &get_TLI;
@@ -705,7 +723,8 @@ llvmGetPassPluginInfo() {
       // ClangTVFinalizePass internally checks whether we're running clang tv
       // and finalizes resources then.
       PB.registerOptimizerLastEPCallback(
-          [](llvm::ModulePassManager &MPM, llvm::OptimizationLevel) {
+          [](llvm::ModulePassManager &MPM, llvm::OptimizationLevel,
+             llvm::ThinOrFullLTOPhase) {
             MPM.addPass(ClangTVFinalizePass());
           });
 

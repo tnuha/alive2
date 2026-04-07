@@ -3,10 +3,15 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
+#include "ir/attrs.h"
 #include "ir/value.h"
 #include <string>
 #include <utility>
 #include <vector>
+
+#define RAUW(val)                                                              \
+  if (val == &what)                                                            \
+  val = &with
 
 namespace IR {
 
@@ -66,7 +71,7 @@ public:
 class FpBinOp final : public Instr {
 public:
   enum Op { FAdd, FSub, FMul, FDiv, FRem, FMax, FMin, FMaximum, FMinimum,
-            CopySign };
+            FMaximumnum, FMinimumnum, CopySign };
 
 private:
   Value *lhs, *rhs;
@@ -77,7 +82,7 @@ private:
 
 public:
   FpBinOp(Type &type, std::string &&name, Value &lhs, Value &rhs, Op op,
-          FastMathFlags fmath, FpRoundingMode rm = {}, FpExceptionMode ex = {})
+          FastMathFlags fmath, FpRoundingMode rm, FpExceptionMode ex)
   : Instr(type, std::move(name)), lhs(&lhs), rhs(&rhs), op(op), fmath(fmath),
     rm(rm), ex(ex) {}
 
@@ -141,8 +146,7 @@ private:
 
 public:
   FpUnaryOp(Type &type, std::string &&name, Value &val, Op op,
-            FastMathFlags fmath, FpRoundingMode rm = {},
-            FpExceptionMode ex = {})
+            FastMathFlags fmath, FpRoundingMode rm, FpExceptionMode ex)
     : Instr(type, std::move(name)), val(&val), op(op), fmath(fmath), rm(rm),
       ex(ex) {}
 
@@ -151,6 +155,34 @@ public:
   FastMathFlags getFastMathFlags() const { return fmath; }
   FpRoundingMode getRoundingMode() const { return rm; }
   FpExceptionMode getExceptionMode() const { return ex; }
+  std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
+  bool hasSideEffects() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr>
+    dup(Function &f, const std::string &suffix) const override;
+};
+
+
+class FpUnaryOpVerticalZip final : public Instr {
+public:
+  enum Op {
+    FrExp
+  };
+
+private:
+  Value *val;
+  Op op;
+
+public:
+FpUnaryOpVerticalZip(Type &type, std::string &&name, Value &val, Op op)
+    : Instr(type, std::move(name)), val(&val), op(op) {}
+
+  Op getOp() const { return op; }
+  Value& getValue() const { return *val; }
   std::vector<Value*> operands() const override;
   bool propagatesPoison() const override;
   bool hasSideEffects() const override;
@@ -192,9 +224,45 @@ public:
 };
 
 
+class FpUnaryReductionOp final : public Instr {
+public:
+  enum Op {
+    FMin, FMax, FMinimum, FMaximum
+  };
+
+private:
+  Value *val;
+  Op op;
+  FastMathFlags fmath;
+  FpRoundingMode rm;
+  FpExceptionMode ex;
+
+public:
+  FpUnaryReductionOp(Type &type, std::string &&name, Value &val, Op op,
+                     FastMathFlags fmath, FpRoundingMode rm, FpExceptionMode ex)
+  : Instr(type, std::move(name)), val(&val), op(op), fmath(fmath), rm(rm), ex(ex) {}
+
+  Op getOp() const { return op; }
+
+  FastMathFlags getFastMathFlags() const { return fmath; }
+  FpRoundingMode getRoundingMode() const { return rm; }
+  FpExceptionMode getExceptionMode() const { return ex; }
+  std::vector<Value *> operands() const override;
+  bool propagatesPoison() const override;
+  bool hasSideEffects() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr>
+    dup(Function &f, const std::string &suffix) const override;
+};
+
+
 class TernaryOp final : public Instr {
 public:
-  enum Op { FShl, FShr, SMulFix, UMulFix, SMulFixSat, UMulFixSat };
+  enum Op { FShl, FShr, SMulFix, UMulFix, SMulFixSat, UMulFixSat,
+            ObjectSize };
 
 private:
   Value *a, *b, *c;
@@ -231,8 +299,7 @@ private:
 
 public:
   FpTernaryOp(Type &type, std::string &&name, Value &a, Value &b, Value &c,
-              Op op, FastMathFlags fmath, FpRoundingMode rm = {},
-              FpExceptionMode ex = {})
+              Op op, FastMathFlags fmath, FpRoundingMode rm, FpExceptionMode ex)
     : Instr(type, std::move(name)), a(&a), b(&b), c(&c), op(op), fmath(fmath),
       rm(rm), ex(ex) {}
 
@@ -279,7 +346,7 @@ public:
 
 class ConversionOp final : public Instr {
 public:
-  enum Op { SExt, ZExt, Trunc, BitCast, Ptr2Int, Int2Ptr };
+  enum Op { SExt, ZExt, Trunc, BitCast, Ptr2Int, Int2Ptr, Ptr2Addr };
   enum Flags { None = 0, NNEG = 1 << 0, NSW = 1 << 1, NUW = 1 << 2 };
 
 private:
@@ -308,8 +375,8 @@ public:
 
 class FpConversionOp final : public Instr {
 public:
-  enum Op { SIntToFP, UIntToFP, FPToSInt, FPToUInt, FPExt, FPTrunc, LRInt,
-            LRound };
+  enum Op { SIntToFP, UIntToFP, FPToSInt, FPToSInt_Sat, FPToUInt, FPToUInt_Sat,
+            FPExt, FPTrunc, LRInt, LRound };
   enum Flags { None = 0, NNEG = 1 << 0 };
 
 private:
@@ -318,16 +385,20 @@ private:
   FpRoundingMode rm;
   FpExceptionMode ex;
   unsigned flags;
+  FastMathFlags fmath;
 
 public:
   FpConversionOp(Type &type, std::string &&name, Value &val, Op op,
-                 FpRoundingMode rm = {}, FpExceptionMode ex = {},
-                 unsigned flags = None);
+                 FpRoundingMode rm, FpExceptionMode ex, unsigned flags,
+                 FastMathFlags fmath);
 
   Op getOp() const { return op; }
   FpRoundingMode getRoundingMode() const { return rm; }
   FpExceptionMode getExceptionMode() const { return ex; }
   unsigned getFlags() const { return flags; }
+  FastMathFlags getFastMathFlags() const {
+    return fmath;
+  }
 
   std::vector<Value*> operands() const override;
   bool propagatesPoison() const override;
@@ -418,17 +489,20 @@ public:
     PROVENANCE, // compare pointer provenance & offsets
     OFFSETONLY // cmp ofs only. meaningful only when ptrs are based on same obj
   };
+  enum Flags { None = 0, SameSign = 1 << 0 };
 
 private:
   Value *a, *b;
   std::string cond_name;
   Cond cond;
+  unsigned flags;
   bool defined;
   PtrCmpMode pcmode = INTEGRAL;
   smt::expr cond_var() const;
 
 public:
-  ICmp(Type &type, std::string &&name, Cond cond, Value &a, Value &b);
+  ICmp(Type &type, std::string &&name, Cond cond, Value &a, Value &b,
+       unsigned flags = None);
 
   bool isPtrCmp() const;
   PtrCmpMode getPtrCmpMode() const { return pcmode; }
@@ -461,7 +535,7 @@ private:
 
 public:
   FCmp(Type &type, std::string &&name, Cond cond, Value &a, Value &b,
-       FastMathFlags fmath, FpExceptionMode ex = {}, bool signaling = false)
+       FastMathFlags fmath, FpExceptionMode ex, bool signaling)
     : Instr(type, std::move(name)), a(&a), b(&b), cond(cond), fmath(fmath),
       ex(ex), signaling(signaling) {}
 
@@ -510,6 +584,7 @@ public:
 
   void addValue(Value &val, std::string &&BB_name);
   void removeValue(const std::string &BB_name);
+  void removeValue(const Value *value);
   void replaceSourceWith(const std::string &from, const std::string &to);
 
   void setValue(size_t index, Value &val);
@@ -633,72 +708,6 @@ public:
 };
 
 
-class Assume final : public Instr {
-public:
-  enum Kind {
-    AndNonPoison, /// cond should be non-poison and hold
-    WellDefined,  /// cond only needs to be well defined (can be false)
-    Align,        /// args[0] satisfies alignment args[1]
-    Dereferenceable,       /// args[0] is dereferenceable at least args[1]
-    DereferenceableOrNull, /// args[0] is null or deref least args[1]
-    NonNull       /// args[0] is a nonnull pointer
-  };
-
-private:
-  std::vector<Value*> args;
-  Kind kind;
-
-public:
-  Assume(Value &cond, Kind kind);
-  Assume(std::vector<Value *> &&args, Kind kind);
-
-  Kind getKind() const { return kind; }
-  std::vector<Value*> operands() const override;
-  bool propagatesPoison() const override;
-  bool hasSideEffects() const override;
-  void rauw(const Value &what, Value &with) override;
-  void print(std::ostream &os) const override;
-  StateValue toSMT(State &s) const override;
-  smt::expr getTypeConstraints(const Function &f) const override;
-  std::unique_ptr<Instr>
-    dup(Function &f, const std::string &suffix) const override;
-};
-
-
-// yields poison if invalid
-class AssumeVal final : public Instr {
-public:
-  enum Kind {
-    Align,
-    NonNull,
-    Range,
-  };
-
-private:
-  Value *val;
-  std::vector<Value*> args;
-  Kind kind;
-  bool is_welldefined;
-
-public:
-  AssumeVal(Type &type, std::string &&name, Value &val,
-            std::vector<Value *> &&args, Kind kind,
-            bool is_welldefined = false);
-
-  Kind getKind() const { return kind; }
-  bool isWellDefined() const { return is_welldefined; }
-  std::vector<Value*> operands() const override;
-  bool propagatesPoison() const override;
-  bool hasSideEffects() const override;
-  void rauw(const Value &what, Value &with) override;
-  void print(std::ostream &os) const override;
-  StateValue toSMT(State &s) const override;
-  smt::expr getTypeConstraints(const Function &f) const override;
-  std::unique_ptr<Instr>
-    dup(Function &f, const std::string &suffix) const override;
-};
-
-
 class MemInstr : public Instr {
 public:
   MemInstr(Type &type, std::string &&name) : Instr(type, std::move(name)) {}
@@ -720,7 +729,8 @@ public:
   virtual uint64_t getMaxGEPOffset() const = 0;
 
   struct ByteAccessInfo {
-    bool hasIntByteAccess = false;
+    bool doesIntLoad = false;
+    bool doesIntStore = false;
     bool doesPtrLoad = false;
     bool doesPtrStore = false;
     bool observesAddresses = false;
@@ -734,13 +744,89 @@ public:
 
     bool doesMemAccess() const { return byteSize; }
 
-    static ByteAccessInfo intOnly(unsigned byteSize);
+    static ByteAccessInfo intLoad(unsigned byteSize);
+    static ByteAccessInfo intStore(unsigned byteSize);
     static ByteAccessInfo anyType(unsigned byteSize);
     static ByteAccessInfo get(const Type &t, bool store, unsigned align);
-    static ByteAccessInfo full(unsigned byteSize);
   };
 
   virtual ByteAccessInfo getByteAccessInfo() const = 0;
+};
+
+
+class Assume final : public MemInstr {
+public:
+  enum Kind {
+    AndNonPoison, /// cond should be non-poison and hold
+    WellDefined,  /// cond only needs to be well defined (can be false)
+    Align,        /// args[0] satisfies alignment args[1]
+    Dereferenceable,       /// args[0] is dereferenceable at least args[1]
+    DereferenceableOrNull, /// args[0] is null or deref least args[1]
+    NonNull       /// args[0] is a nonnull pointer
+  };
+
+private:
+  std::vector<Value*> args;
+  Kind kind;
+
+public:
+  Assume(Value &cond, Kind kind);
+  Assume(std::vector<Value *> &&args, Kind kind);
+
+  std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
+  Kind getKind() const { return kind; }
+  std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
+  bool hasSideEffects() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr>
+    dup(Function &f, const std::string &suffix) const override;
+};
+
+
+// yields poison if invalid
+class AssumeVal final : public MemInstr {
+public:
+  enum Kind {
+    Align,
+    NonNull,
+    Range,
+  };
+
+private:
+  Value *val;
+  std::vector<Value*> args;
+  Kind kind;
+  bool is_welldefined;
+
+public:
+  AssumeVal(Type &type, std::string &&name, Value &val,
+            std::vector<Value *> &&args, Kind kind,
+            bool is_welldefined = false);
+
+  std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
+  Kind getKind() const { return kind; }
+  bool isWellDefined() const { return is_welldefined; }
+  std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
+  bool hasSideEffects() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr>
+    dup(Function &f, const std::string &suffix) const override;
 };
 
 
@@ -941,18 +1027,17 @@ public:
 class Memset final : public MemInstr {
   Value *ptr, *val, *bytes;
   uint64_t align;
-  bool is_tailcall;
+  TailCallInfo tci;
 
 public:
-  Memset(Value &ptr, Value &val, Value &bytes, uint64_t align, bool is_tailcall)
-    : MemInstr(Type::voidTy, "memset"), ptr(&ptr), val(&val), bytes(&bytes),
-            align(align), is_tailcall(is_tailcall) {}
+  Memset(Value &ptr, Value &val, Value &bytes, uint64_t align, TailCallInfo tci)
+      : MemInstr(Type::voidTy, "memset"), ptr(&ptr), val(&val), bytes(&bytes),
+        align(align), tci(tci) {}
 
   Value& getPtr() const { return *ptr; }
   Value& getBytes() const { return *bytes; }
   uint64_t getAlign() const { return align; }
   void setAlign(uint64_t align) { this->align = align; }
-  bool isTailCall() const { return is_tailcall; }
 
   std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
@@ -973,35 +1058,13 @@ public:
 class MemsetPattern final : public MemInstr {
   Value *ptr, *pattern, *bytes;
   unsigned pattern_length;
-  bool is_tailcall;
+  TailCallInfo tci;
 
 public:
   MemsetPattern(Value &ptr, Value &pattern, Value &bytes,
-                unsigned pattern_length, bool is_tailcall);
+                unsigned pattern_length, TailCallInfo tci);
 
   unsigned getPatternLength() const { return pattern_length; }
-  bool isTailCall() const { return is_tailcall; }
-
-  std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
-  uint64_t getMaxAccessSize() const override;
-  uint64_t getMaxGEPOffset() const override;
-  ByteAccessInfo getByteAccessInfo() const override;
-
-  std::vector<Value*> operands() const override;
-  bool propagatesPoison() const override;
-  void rauw(const Value &what, Value &with) override;
-  void print(std::ostream &os) const override;
-  StateValue toSMT(State &s) const override;
-  smt::expr getTypeConstraints(const Function &f) const override;
-  std::unique_ptr<Instr>
-    dup(Function &f, const std::string &suffix) const override;
-};
-
-
-class FillPoison final : public MemInstr {
-  Value *ptr;
-public:
-  FillPoison(Value &ptr) : MemInstr(Type::voidTy, "fillpoison"), ptr(&ptr) {}
 
   std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
@@ -1023,14 +1086,13 @@ class Memcpy final : public MemInstr {
   Value *dst, *src, *bytes;
   uint64_t align_dst, align_src;
   bool move;
-  bool is_tailcall;
+  TailCallInfo tci;
 
 public:
-  Memcpy(Value &dst, Value &src, Value &bytes,
-         uint64_t align_dst, uint64_t align_src, bool move, bool is_tailcall)
-    : MemInstr(Type::voidTy, "memcpy"), dst(&dst), src(&src), bytes(&bytes),
-            align_dst(align_dst), align_src(align_src), move(move),
-            is_tailcall(is_tailcall) {}
+  Memcpy(Value &dst, Value &src, Value &bytes, uint64_t align_dst,
+         uint64_t align_src, bool move, TailCallInfo tci)
+      : MemInstr(Type::voidTy, "memcpy"), dst(&dst), src(&src), bytes(&bytes),
+        align_dst(align_dst), align_src(align_src), move(move), tci(tci) {}
 
   Value& getSrc() const { return *src; }
   Value& getDst() const { return *dst; }
@@ -1040,7 +1102,6 @@ public:
   void setSrcAlign(uint64_t align) { align_src = align; }
   void setDstAlign(uint64_t align) { align_dst = align; }
   bool isMove() const { return move; }
-  bool isTailCall() const { return is_tailcall; }
 
   std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
@@ -1061,17 +1122,16 @@ public:
 class Memcmp final : public MemInstr {
   Value *ptr1, *ptr2, *num;
   bool is_bcmp;
-  bool is_tailcall;
+  TailCallInfo tci;
 
 public:
   Memcmp(Type &type, std::string &&name, Value &ptr1, Value &ptr2, Value &num,
-         bool is_bcmp, bool is_tailcall) : MemInstr(type, std::move(name)),
-                ptr1(&ptr1), ptr2(&ptr2), num(&num), is_bcmp(is_bcmp),
-                is_tailcall(is_tailcall) {}
+         bool is_bcmp, TailCallInfo tci)
+      : MemInstr(type, std::move(name)), ptr1(&ptr1), ptr2(&ptr2), num(&num),
+        is_bcmp(is_bcmp), tci(tci) {}
 
   Value &getBytes() const { return *num; }
   bool isBCmp() const { return is_bcmp; }
-  bool isTailCall() const { return is_tailcall; }
 
   std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
@@ -1091,14 +1151,13 @@ public:
 
 class Strlen final : public MemInstr {
   Value *ptr;
-  bool is_tailcall;
+  TailCallInfo tci;
 
 public:
-  Strlen(Type &type, std::string &&name, Value &ptr, bool is_tailcall)
-    : MemInstr(type, std::move(name)), ptr(&ptr), is_tailcall(is_tailcall) {}
+  Strlen(Type &type, std::string &&name, Value &ptr, TailCallInfo tci)
+      : MemInstr(type, std::move(name)), ptr(&ptr), tci(tci) {}
 
   Value *getPointer() const { return ptr; }
-  bool isTailCall() const { return is_tailcall; }
 
   std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
@@ -1124,6 +1183,7 @@ private:
   FnAttrs attrs;
   unsigned var_arg_idx;
   bool approx = false;
+  TailCallInfo tci;
 
   Value* getAlignArg() const;
 
@@ -1142,6 +1202,7 @@ public:
   void setApproximated(bool flag) { approx = flag; }
   uint64_t getAlign() const;
   bool isIndirect() const { return fnptr != nullptr; }
+  void setTailCallSite(TailCallInfo tci) { this->tci = tci; }
 
   std::pair<uint64_t, uint64_t> getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;

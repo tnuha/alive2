@@ -264,6 +264,13 @@ public:
   }
 
 private:
+  long limit(unsigned long v, int w) {
+    if (w < 64)
+      return v & ((1ULL << w) - 1);
+    else
+      return v;
+  }
+
   BinaryOperator *randomBinop(Value *LHS, Value *RHS) {
     switch (C.choose(13)) {
     case 0: {
@@ -339,7 +346,7 @@ private:
 
   // uniformly chosen 16-bit constant -- we'll get them all eventually
   APInt uniform16(int Width) {
-    return APInt(Width, C.choose(0xFFFF + 1));
+    return APInt(Width, limit(C.choose(0xFFFF + 1), Width));
   }
 
   // uniformly choose a Hamming weight and then uniformly select a value
@@ -385,7 +392,7 @@ private:
 
   // uniform random choice from the entire range
   APInt uniformInt(int Width) {
-    return APInt(Width, C.dist());
+    return APInt(Width, limit(C.dist(), Width));
   }
 
   // chosen values
@@ -439,12 +446,12 @@ private:
       auto I = P.at(C.choose(P.size()));
       switch (C.choose(3)) {
       case 0: {
-        APInt Delta(Width, C.choose(8) + 1);
+        APInt Delta(Width, limit(C.choose(8) + 1, Width));
         I += C.flip() ? Delta : -Delta;
         break;
       }
       case 1:
-        I ^= APInt(Width, 1 << C.choose(Width));
+        I ^= APInt(Width, limit(1 << C.choose(Width), Width));
         break;
       case 2:
         I = ~I;
@@ -546,7 +553,7 @@ private:
     if (Op == Intrinsic::abs || Op == Intrinsic::ctlz || Op == Intrinsic::cttz)
       Args.push_back(ConstantInt::get(Type::getInt1Ty(Ctx), C.flip() ? 1 : 0));
 
-    auto Decl = Intrinsic::getDeclaration(M, Op, Ty);
+    auto Decl = Intrinsic::getOrInsertDeclaration(M, Op, Ty);
     auto *I = CallInst::Create(Decl, Args, "", BB);
     return I;
   }
@@ -610,7 +617,7 @@ private:
       assert(false);
     }
 
-    auto Decl = Intrinsic::getDeclaration(M, Op, Ty);
+    auto Decl = Intrinsic::getOrInsertDeclaration(M, Op, Ty);
     auto *I = CallInst::Create(Decl, {LHS, RHS}, "", BB);
     if (Op == Intrinsic::ssub_with_overflow ||
         Op == Intrinsic::usub_with_overflow ||
@@ -664,7 +671,7 @@ private:
                                  Type::getInt32Ty(BB->getContext()))
                   : getVal(Ty);
 
-    auto Decl = Intrinsic::getDeclaration(M, Op, Ty);
+    auto Decl = Intrinsic::getOrInsertDeclaration(M, Op, Ty);
     auto *I = CallInst::Create(Decl, {A, B, C}, "", BB);
     return I;
   }
@@ -837,7 +844,7 @@ void BBFuzzer::go() {
     } break;
     case 1: {
       auto *Dest = BBs[1 + C.choose(NumBBs - 1)];
-      BranchInst::Create(Dest, BBs[i]);
+      UncondBrInst::Create(Dest, BBs[i]);
     } break;
     case 2: {
       auto *Dest1 = BBs[1 + C.choose(NumBBs - 1)];
@@ -854,7 +861,7 @@ void BBFuzzer::go() {
                         : (Value *)ConstantInt::get(IntTy, C.choose(20));
         Cond = new ICmpInst(BBs[i], VG.randomPred(), LHS, RHS);
       }
-      BranchInst::Create(Dest1, Dest2, Cond, BBs[i]);
+      CondBrInst::Create(Cond, Dest1, Dest2, BBs[i]);
     } break;
     case 3: {
       unsigned long NumCases = 1 + C.choose(2 * NumBBs);
@@ -922,7 +929,6 @@ reduced using llvm-reduce.
   llvm_util::initializer llvm_util_init(*out, DL);
   smt::smt_initializer smt_init;
   Verifier verifier(TLI, smt_init, *out);
-  verifier.quiet = opt_quiet;
   verifier.always_verify = opt_always_verify;
   verifier.print_dot = opt_print_dot;
   verifier.bidirectional = opt_bidirectional;
@@ -953,12 +959,12 @@ reduced using llvm-reduce.
       report_fatal_error("Broken module found, this should not happen");
 
     if (opt_run_sroa) {
-      auto err = optimize_module(&M1, "sroa,dse");
+      auto err = optimize_module(M1, "sroa,dse");
       assert(err.empty());
     }
 
     if (opt_run_dce) {
-      auto err = optimize_module(&M1, "adce");
+      auto err = optimize_module(M1, "adce");
       assert(err.empty());
     }
 
@@ -985,7 +991,7 @@ reduced using llvm-reduce.
       continue;
 
     auto M2 = CloneModule(M1);
-    auto err = optimize_module(M2.get(), optPass);
+    auto err = optimize_module(*M2.get(), optPass);
     if (!err.empty()) {
       *out << "Error parsing list of LLVM passes: " << err << '\n';
       return -1;

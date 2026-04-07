@@ -48,7 +48,12 @@ static Type& get_sym_type();
 static Value& parse_operand(Type &type);
 
 static Value& get_constant(uint64_t n, Type &t) {
-  auto c = make_unique<IntConst>(t, n);
+  unique_ptr<Value> c;
+  if (t.isFloatType()) {
+    c = make_unique<FloatConst>(t, to_string(n), true);
+  } else {
+    c = make_unique<IntConst>(t, n);
+  }
   auto ret = c.get();
   fn->addConstant(std::move(c));
   return *ret;
@@ -281,6 +286,7 @@ static uint64_t parse_number() {
 
 
 static unordered_map<Type*, unique_ptr<StructType>> overflow_aggregate_types;
+static unordered_map<Type*, unique_ptr<StructType>> float_i32_types;
 static vector<unique_ptr<SymbolicType>> sym_types;
 static unsigned sym_num;
 static unsigned struct_num;
@@ -310,6 +316,16 @@ static Type& get_int_type(unsigned size) {
     int_types[size] = make_unique<IntType>("i" + to_string(size), size);
 
   return *int_types[size].get();
+}
+
+static Type& get_float_i32_type(Type &type) {
+  auto p = float_i32_types.try_emplace(&type);
+  auto &st = p.first->second;
+  if (p.second)
+    st = make_unique<StructType>("structty_" + to_string(struct_num++),
+           vector<Type*>({ &type, &get_int_type(32) }),
+           vector<bool>({ false, false }));
+  return *st.get();
 }
 
 static Type& get_pointer_type(unsigned address_space_number) {
@@ -539,6 +555,9 @@ static Value& parse_aggregate_constant(Type &type, token close_tk) {
 
   tokenizer.ensure(close_tk);
 
+  if (vals.size() != type.getAsAggregateType()->numElementsConst())
+    error("Wrong number of elements in aggregate constant");
+
   auto c = make_unique<AggregateValue>(type, std::move(vals));
   auto ret = c.get();
   fn->addConstant(std::move(c));
@@ -663,6 +682,8 @@ static unsigned parse_binop_flags(token op_token) {
   case FMIN:
   case FMAXIMUM:
   case FMINIMUM:
+  case FMAXIMUMNUM:
+  case FMINIMUMNUM:
   case SREM:
   case UREM:
   case UADD_SAT:
@@ -787,10 +808,13 @@ static unique_ptr<Instr> parse_fp_binop(string_view name, token op_token) {
   case FMIN:     op = FpBinOp::FMin; break;
   case FMAXIMUM: op = FpBinOp::FMaximum; break;
   case FMINIMUM: op = FpBinOp::FMinimum; break;
+  case FMAXIMUMNUM: op = FpBinOp::FMaximumnum; break;
+  case FMINIMUMNUM: op = FpBinOp::FMinimumnum; break;
   default:
     UNREACHABLE();
   }
-  return make_unique<FpBinOp>(*rettype, string(name), a, b, op, fmath);
+  return make_unique<FpBinOp>(*rettype, string(name), a, b, op, fmath,
+                              FpRoundingMode(), FpExceptionMode());
 }
 
 static unique_ptr<Instr> parse_unaryop(string_view name, token op_token) {
@@ -822,7 +846,23 @@ static unique_ptr<Instr> parse_fp_unaryop(string_view name, token op_token) {
 
   auto &ty = parse_type();
   auto &a = parse_operand(ty);
-  return make_unique<FpUnaryOp>(ty, string(name), a, op, fmath);
+  return make_unique<FpUnaryOp>(ty, string(name), a, op, fmath,
+                                FpRoundingMode(), FpExceptionMode());
+}
+
+static unique_ptr<Instr>
+parse_fp_unary_verticalzip(string_view name, token op_token) {
+  FpUnaryOpVerticalZip::Op op;
+  switch (op_token) {
+  case FREXP: op = FpUnaryOpVerticalZip::FrExp; break;
+  default:
+    UNREACHABLE();
+  }
+
+  auto &ty = parse_type();
+  auto &a = parse_operand(ty);
+  return make_unique<FpUnaryOpVerticalZip>(get_float_i32_type(ty), string(name),
+                                           a, op);
 }
 
 static unique_ptr<Instr> parse_unary_reduction_op(string_view name,
@@ -847,6 +887,25 @@ static unique_ptr<Instr> parse_unary_reduction_op(string_view name,
 
   auto &a = parse_operand(op_ty);
   return make_unique<UnaryReductionOp>(ty, string(name), a, op);
+}
+
+static unique_ptr<Instr> parse_fp_unary_reduction_op(string_view name, token op_token) {
+  FpUnaryReductionOp::Op op;
+  auto fmath = parse_fast_math(op_token);
+  switch (op_token) {
+  case REDUCE_FMAX: op = FpUnaryReductionOp::FMax; break;
+  case REDUCE_FMIN: op = FpUnaryReductionOp::FMin; break;
+  case REDUCE_FMAXIMUM: op = FpUnaryReductionOp::FMaximum; break;
+  case REDUCE_FMINIMUM: op = FpUnaryReductionOp::FMinimum; break;
+  default: UNREACHABLE();
+  }
+
+  auto &op_ty = parse_type();
+  auto &ty =
+      op_ty.isVectorType() ? op_ty.getAsAggregateType()->getChild(0) : op_ty;
+  auto &a = parse_operand(op_ty);
+  return make_unique<FpUnaryReductionOp>(ty, string(name), a, op, fmath,
+                                         FpRoundingMode(), FpExceptionMode());
 }
 
 static unique_ptr<Instr> parse_ternary(string_view name, token op_token) {
@@ -891,7 +950,8 @@ static unique_ptr<Instr> parse_fp_ternary(string_view name, token op_token) {
   parse_comma();
   auto &cty = parse_type();
   auto &c = parse_operand(cty);
-  return make_unique<FpTernaryOp>(aty, string(name), a, b, c, op, fmath);
+  return make_unique<FpTernaryOp>(aty, string(name), a, b, c, op, fmath,
+                                  FpRoundingMode(), FpExceptionMode());
 }
 
 static unique_ptr<Instr> parse_conversionop(string_view name, token op_token) {
@@ -931,7 +991,10 @@ parse_fp_conversionop(string_view name, token op_token) {
   default:
     UNREACHABLE();
   }
-  return make_unique<FpConversionOp>(ty2, string(name), val, op);
+  return make_unique<FpConversionOp>(ty2, string(name), val, op,
+                                     FpRoundingMode(), FpExceptionMode(),
+                                     FpConversionOp::None,
+                                     parse_fast_math(op_token));
 }
 
 static unique_ptr<Instr> parse_select(string_view name) {
@@ -1045,7 +1108,7 @@ static unique_ptr<Instr> parse_fcmp(string_view name) {
                                 UnaryOp::Copy);
   default:
     return make_unique<FCmp>(bool_ty, string(name), cond, a, b,
-                             parse_fast_math(FCMP));
+                             parse_fast_math(FCMP), FpExceptionMode(), false);
   }
   UNREACHABLE();
 }
@@ -1220,6 +1283,8 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   case FMIN:
   case FMAXIMUM:
   case FMINIMUM:
+  case FMAXIMUMNUM:
+  case FMINIMUMNUM:
     return parse_fp_binop(name, t);
   case BITREVERSE:
   case BSWAP:
@@ -1229,6 +1294,8 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   case FABS:
   case FNEG:
     return parse_fp_unaryop(name, t);
+  case FREXP:
+    return parse_fp_unary_verticalzip(name, t);
   case REDUCE_ADD:
   case REDUCE_MUL:
   case REDUCE_AND:
@@ -1239,6 +1306,11 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   case REDUCE_UMAX:
   case REDUCE_UMIN:
     return parse_unary_reduction_op(name, t);
+  case REDUCE_FMAX:
+  case REDUCE_FMIN:
+  case REDUCE_FMAXIMUM:
+  case REDUCE_FMINIMUM:
+    return parse_fp_unary_reduction_op(name, t);
   case FSHL:
   case FSHR:
   case SMULFIX:
@@ -1295,7 +1367,8 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   case POISON:
   case REGISTER:
   case ARRAY_TYPE_PREFIX:
-    return parse_copyop(name, t);
+    if (!name.empty())
+      return parse_copyop(name, t);
   default:
     tokenizer.unget(t);
     return nullptr;
@@ -1437,6 +1510,7 @@ parser_initializer::~parser_initializer() {
   int_types.clear();
   sym_types.clear();
   overflow_aggregate_types.clear();
+  float_i32_types.clear();
 }
 
 }

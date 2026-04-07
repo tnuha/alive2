@@ -69,7 +69,7 @@ static expr attr_to_bitvec(const ParamAttrs &attrs) {
 namespace IR {
 
 Pointer::Pointer(const Memory &m, const expr &bid, const expr &offset,
-                 const expr &attr) : m(m),
+                 const expr &attr) : m(const_cast<Memory&>(m)),
   p(prepend_if(expr::mkUInt(0, 1 + padding_logical()),
                bid.concat(offset), hasLogicalBit())) {
   if (bits_for_ptrattrs)
@@ -78,21 +78,24 @@ Pointer::Pointer(const Memory &m, const expr &bid, const expr &offset,
 }
 
 Pointer::Pointer(const Memory &m, const char *var_name,
-                 const ParamAttrs &attr) : m(m) {
-  unsigned bits = bitsShortBid() + bits_for_offset;
-  p = expr::mkVar(var_name, bits, false)
+                 const ParamAttrs &attr, const set<expr> &fn_vars)
+  : m(const_cast<Memory&>(m)) {
+  auto ty = expr::mkUInt(0, bitsShortBid() + bits_for_offset);
+  vector<expr> vars(fn_vars.begin(), fn_vars.end());
+  p = expr::mkUF(var_name, vars, ty)
         .zext(hasLocalBit() + (1 + padding_logical()) * hasLogicalBit());
   if (bits_for_ptrattrs)
     p = p.concat(attr_to_bitvec(attr));
   assert(p.bits() == totalBits());
 }
 
-Pointer::Pointer(const Memory &m, expr repr) : m(m), p(std::move(repr)) {
+Pointer::Pointer(const Memory &m, expr repr)
+  : m(const_cast<Memory&>(m)), p(std::move(repr)) {
   assert(!p.isValid() || p.bits() == totalBits());
 }
 
 Pointer::Pointer(const Memory &m, unsigned bid, bool local, expr attr)
-  : m(m), p(
+  : m(const_cast<Memory&>(m)), p(
     prepend_if(expr::mkUInt(0, 1 + padding_logical()),
       prepend_if(expr::mkUInt(local, 1),
                  expr::mkUInt(bid, bitsShortBid())
@@ -115,7 +118,7 @@ Pointer Pointer::mkPhysical(const Memory &m, const expr &addr) {
 Pointer Pointer::mkPhysical(const Memory &m, const expr &addr,
                             const expr &attr) {
   assert(hasLogicalBit());
-  assert(addr.bits() == bits_ptr_address);
+  assert(!addr.isValid() || addr.bits() == bits_ptr_address);
   auto p = expr::mkUInt(1, 1)
            .concat_zeros(padding_physical())
            .concat(addr);
@@ -192,10 +195,12 @@ expr Pointer::isLogical() const {
 }
 
 expr Pointer::isLocal(bool simplify) const {
-  if (m.numLocals() == 0)
-    return false;
-  if (m.numNonlocals() == 0)
-    return true;
+  if (simplify || !hasLocalBit()) {
+    if (m.numLocals() == 0)
+      return false;
+    if (m.numNonlocals() == 0)
+      return true;
+  }
 
   auto bit = bits_for_bid - 1 + bits_for_offset + bits_for_ptrattrs;
   expr local = p.extract(bit, bit);
@@ -276,8 +281,8 @@ expr Pointer::getValue(const char *name, const FunctionExpr &local_fn,
   if (auto val = nonlocal_fn.lookup(bid))
     non_local = *val;
   else {
-    string uf = src_name ? local_name(m.state, name) : name;
-    non_local = expr::mkUF(uf.c_str(), { bid }, ret_type);
+    non_local = expr::mkUF(src_name ? local_name(m.state, name).c_str() : name,
+                           { bid }, ret_type);
   }
 
   if (auto local = local_fn(bid))
@@ -324,9 +329,28 @@ expr Pointer::blockSize() const {
                   expr::mkUInt(0, bits_size_t));
 }
 
+expr Pointer::blockMaxSize() const {
+  return
+    mkIf_fold(getAllocType() == GROWABLE,
+              getValue("blk_max_size", m.local_blk_size, {},
+                       expr::mkUInt(0, bits_size_t)),
+              blockSize());
+}
+
 expr Pointer::blockSizeOffsetT() const {
   expr sz = blockSize();
   return bits_for_offset > bits_size_t ? sz.zextOrTrunc(bits_for_offset) : sz;
+}
+
+expr Pointer::blockMaxSizeOffsetT() const {
+  expr sz = blockMaxSize();
+  return bits_for_offset > bits_size_t ? sz.zextOrTrunc(bits_for_offset) : sz;
+}
+
+expr Pointer::leftoverSize() const {
+  auto off = getOffsetSizet();
+  auto sz  = blockSizeOffsetT();
+  return expr::mkIf(off.ule(sz), sz - off, expr::mkUInt(0, sz));
 }
 
 expr Pointer::reprWithoutAttrs() const {
@@ -346,7 +370,7 @@ Pointer Pointer::operator+(const expr &bytes) const {
     );
 }
 
-Pointer Pointer::operator+(unsigned bytes) const {
+Pointer Pointer::operator+(uint64_t bytes) const {
   return *this + expr::mkUInt(bytes, bits_for_offset);
 }
 
@@ -390,7 +414,7 @@ expr Pointer::isOfBlock(const Pointer &block, const expr &bytes,
   assert(block.getOffset().isZero());
   expr addr       = is_phy ? getPhysicalAddress() : getAddress();
   expr block_addr = block.getLogAddress();
-  expr block_size = block.blockSize();
+  expr block_size = block.blockSizeOffsetT();
 
   if (bytes.eq(block_size))
     return addr == block_addr;
@@ -419,19 +443,23 @@ expr Pointer::isInboundsOf(const Pointer &block, const expr &bytes0,
          (addr + bytes).ule(block_addr + block_size);
 }
 
-expr Pointer::isInbounds(bool strict) const {
+expr Pointer::isInbounds(bool strict, bool max_size) const {
   auto offset = getOffsetSizet();
-  auto size   = blockSizeOffsetT();
-  return (strict ? offset.ult(size) : offset.ule(size)) && !offset.isNegative();
+  auto size   = max_size ? blockMaxSizeOffsetT()
+                         : blockSizeOffsetT();
+  expr ret = strict ? offset.ult(size) : offset.ule(size);
+  if (bits_for_offset <= bits_size_t) // implied
+    ret &= !offset.isNegative();
+  return ret;
 }
 
-expr Pointer::inbounds(bool simplify_ptr) {
+expr Pointer::inbounds(bool simplify_ptr, bool max_size) {
   if (!simplify_ptr)
-    return isInbounds(false);
+    return isInbounds(false, max_size);
 
   DisjointExpr<expr> ret(expr(false)), all_ptrs;
   for (auto &[ptr_expr, domain] : DisjointExpr<expr>(p, 3)) {
-    expr inb = Pointer(m, ptr_expr).isInbounds(false);
+    expr inb = Pointer(m, ptr_expr).isInbounds(false, max_size);
     if (!inb.isFalse())
       all_ptrs.add(ptr_expr, domain);
     ret.add(std::move(inb), domain);
@@ -446,7 +474,8 @@ expr Pointer::inbounds(bool simplify_ptr) {
 
 expr Pointer::blockAlignment() const {
   return getValue("blk_align", m.local_blk_align, m.non_local_blk_align,
-                   expr::mkUInt(0, 6), true);
+                   expr::mkUInt(0, Memory::bitsAlignmentInfo()),
+                   has_globals_diff_align);
 }
 
 expr Pointer::isBlockAligned(uint64_t align, bool exact) const {
@@ -465,7 +494,7 @@ expr Pointer::isAligned(uint64_t align) {
     return isNull();
 
   auto offset = getOffset();
-  if (isUndef(offset))
+  if (m.state->isUndef(offset))
     return false;
 
   auto bits = min(ilog2(align), bits_for_offset);
@@ -505,20 +534,39 @@ expr Pointer::isAligned(const expr &align) {
 // When bytes is 0, pointer is always dereferenceable
 pair<AndExpr, expr>
 Pointer::isDereferenceable(const expr &bytes0, uint64_t align,
-                           bool iswrite, bool ignore_accessability,
-                           bool round_size_to_align) {
+                           bool iswrite, bool ignore_accessability) {
   bool is_asm = m.state->isAsmMode();
-  expr bytes = bytes0.zextOrTrunc(bits_size_t);
-  if (round_size_to_align)
-    bytes = bytes.round_up(expr::mkUInt(align, bytes));
-  expr bytes_off = bytes.zextOrTrunc(bits_for_offset);
+  expr bytes = bytes0.zextOrTrunc(bits_for_offset);
 
-  auto block_constraints = [=](const Pointer &p) {
+  auto block_constraints = [&](const Pointer &p) {
     expr ret = p.isBlockAlive();
     if (iswrite)
       ret &= p.isWritable() && !p.isNoWrite();
     else if (!ignore_accessability)
       ret &= !p.isNoRead();
+
+    // If we are loading from an argument and it has the 'initializes'
+    // attribute, make sure we have already stored to it before.
+    if (!ignore_accessability && !iswrite && has_initializes_attr) {
+      auto &s = m.getState();
+      for (auto &input0 : s.getFn().getInputs()) {
+        auto &input = static_cast<const Input&>(input0);
+        auto &inits = input.getAttributes().initializes;
+        if (inits.empty())
+          continue;
+
+        Pointer arg(m, s[input].value);
+        expr offsets = true;
+        for (auto [l, h] : inits) {
+          offsets &= (p.getOffset().uge((arg + l).getOffset()) &&
+                      p.getOffset().ult((arg + h).getOffset())
+                     ).implies(m.hasStored(p, bytes));
+        }
+        // TODO: isBasedOnArg is not sufficient; we have to store the arg number
+        // in the pointer as we can have 2 args with same initializes attr
+        ret&= (p.isBasedOnArg() && p.getBid() == arg.getBid()).implies(offsets);
+      }
+    }
     return ret;
   };
 
@@ -527,41 +575,52 @@ Pointer::isDereferenceable(const expr &bytes0, uint64_t align,
     expr offset   = p.getOffset();
 
     expr cond;
-    if (isUndef(offset) ||
-        isUndef(p.getBid()) ||
-        bytes.ugt(p.blockSize()).isTrue() ||
+    if (m.state->isUndef(offset) ||
+        m.state->isUndef(p.getBid()) ||
+        bytes.ugt(block_sz).isTrue() ||
         p.getOffsetSizet().uge(block_sz).isTrue()) {
       cond = false;
     } else {
-      // check that the offset is within bounds and that arith doesn't overflow
-      cond  = (offset + bytes_off).sextOrTrunc(block_sz.bits()).ule(block_sz);
-      cond &= !offset.isNegative();
-      if (!block_sz.isNegative().isFalse()) // implied if block_sz >= 0
-        cond &= offset.add_no_soverflow(bytes_off);
-
+      // optimized conditions that are equivalent to the condition below
+      if (block_sz.isConst() && bytes.isConst()) {
+        cond = offset.ule(block_sz - bytes);
+      } else if (bits_for_offset > bits_size_t && bytes.isOne()) {
+        cond = offset.ult(block_sz);
+      } else {
+        // check that the offset is within bounds and that arith doesn't overflow
+        cond  = (offset + bytes).ule(block_sz);
+        cond &= !offset.isNegative();
+        if (!block_sz.isNegative().isFalse()) // implied if block_sz >= 0
+          cond &= offset.add_no_soverflow(bytes);
+      }
       cond &= block_constraints(p);
     }
     return cond;
   };
 
-  bool observes_local = m.observed_addrs.numMayAlias(true) > 0;
+  bool escapes_local = m.escaped_local_blks.numMayAlias(true) > 0;
 
   auto phy_ptr = [&](Pointer &p, bool is_phy) -> pair<expr, Pointer> {
-    DisjointExpr<expr> bids(expr::mkUInt(0, bitsShortBid()));
+    DisjointExpr<expr> bids(expr::mkUInt(0, bitsShortBid() + escapes_local));
     DisjointExpr<expr> addrs(expr::mkUInt(0, bits_ptr_address));
     expr ub = false;
     bool all_same_size = true;
+    expr addr = is_phy ? p.getPhysicalAddress() : p.getAddress();
 
-    auto add = [&](unsigned limit, bool local) {
-      for (unsigned i = 0; i != limit; ++i) {
+    auto add = [&](unsigned start, unsigned limit, bool local) {
+      for (unsigned i = start; i < limit; ++i) {
         // address not observed; can't alias with that
-        if (local && !m.observed_addrs.mayAlias(true, i))
+        if (local && !m.escaped_local_blks.mayAlias(true, i))
           continue;
 
         Pointer this_ptr(m, i, local, p.getAttrs());
 
+        bool same_size = bytes.eq(this_ptr.blockSizeOffsetT());
+        expr this_addr = this_ptr.getLogAddress();
+        expr offset = same_size ? expr::mkUInt(0, addr) : addr - this_addr;
+
         expr cond = p.isInboundsOf(this_ptr, bytes, is_phy) &&
-                    block_constraints(this_ptr);
+                    block_constraints(this_ptr + offset);
         if (cond.isFalse())
           continue;
 
@@ -569,21 +628,21 @@ Pointer::isDereferenceable(const expr &bytes0, uint64_t align,
 
         cond = p.isOfBlock(this_ptr, bytes, is_phy);
 
-        all_same_size &= bytes.eq(this_ptr.blockSize());
+        all_same_size &= same_size;
 
         bids.add(
-          observes_local ? this_ptr.getBid() : this_ptr.getShortBid(), cond);
-        addrs.add(this_ptr.getLogAddress(), std::move(cond));
+          escapes_local ? this_ptr.getBid() : this_ptr.getShortBid(), cond);
+        addrs.add(std::move(this_addr), std::move(cond));
       }
     };
-    add(m.numLocals(), true);
-    add(m.numNonlocals(), false);
+    add(0, m.numLocals(), true);
+    add(0, m.numCurrentNonLocals(), false);
+    if (!m.getState().isSource())
+      add(num_nonlocals_src, num_nonlocals, false);
 
     expr bid = *std::move(bids)();
-    if (!observes_local)
+    if (!escapes_local)
       bid = mkLongBid(bid, false);
-
-    expr addr = is_phy ? p.getPhysicalAddress() : p.getAddress();
 
     return { std::move(ub),
              Pointer(m, std::move(bid),
@@ -598,6 +657,9 @@ Pointer::isDereferenceable(const expr &bytes0, uint64_t align,
     Pointer ptr(m, ptr_expr);
     expr is_log = ptr.isLogical();
     expr inbounds = is_asm ? ptr.isInbounds(true) : expr(true);
+
+    if (is_asm && !inbounds.isTrue() && m.state->isImplied(inbounds, domain))
+      inbounds = true;
 
     optional<expr> log_expr, phy_expr;
     optional<Pointer> new_log_ptr;
@@ -662,15 +724,17 @@ Pointer::isDereferenceable(const expr &bytes0, uint64_t align,
   auto ptrs = std::move(all_ptrs)();
   p = ptrs ? *std::move(ptrs) : expr::mkUInt(0, totalBits());
 
+  if (!ignore_accessability && iswrite && has_initializes_attr)
+    m.record_store(*this, bytes);
+
   return { std::move(exprs), *std::move(is_aligned)() };
 }
 
 pair<AndExpr, expr>
 Pointer::isDereferenceable(uint64_t bytes, uint64_t align,
-                           bool iswrite, bool ignore_accessability,
-                           bool round_size_to_align) {
+                           bool iswrite, bool ignore_accessability) {
   return isDereferenceable(expr::mkUInt(bytes, bits_size_t), align, iswrite,
-                           ignore_accessability, round_size_to_align);
+                           ignore_accessability);
 }
 
 // This function assumes that both begin + len don't overflow
@@ -697,7 +761,7 @@ expr Pointer::isBlockAlive() const {
 
 expr Pointer::getAllocType() const {
   return getValue("blk_kind", m.local_blk_kind, m.non_local_blk_kind,
-                   expr::mkUInt(0, 2));
+                   expr::mkUInt(0, 3));
 }
 
 expr Pointer::isStackAllocated(bool simplify) const {
@@ -711,7 +775,35 @@ expr Pointer::isStackAllocated(bool simplify) const {
 
 expr Pointer::isHeapAllocated() const {
   assert(MALLOC == 2 && CXX_NEW == 3);
-  return getAllocType().extract(1, 1) == 1;
+  return getAllocType().extract(2, 1) == 1;
+}
+
+expr Pointer::isGrowableAlloc() const {
+  return getAllocType() == GROWABLE;
+}
+
+static expr at_least_same_offseting(const Pointer &p1, const Pointer &p2,
+                                    bool any_stack) {
+  expr size  = p1.blockSizeOffsetT();
+  expr off   = p1.getOffsetSizet();
+  expr size2 = p2.blockSizeOffsetT();
+  expr off2  = p2.getOffsetSizet();
+  return
+    expr::mkIf(p1.isHeapAllocated(),
+               p1.getAllocType() == p2.getAllocType() &&
+                 off == off2 && size == size2,
+
+               any_stack
+                 ? expr(true)
+                 :expr::mkIf(off.sge(0),
+                             off2.sge(0) &&
+                               expr::mkIf(off.ule(size),
+                                          off2.ule(size2) && off2.uge(off) &&
+                                            (size2 - off2).uge(size - off),
+                                          off2.ugt(size2) && off == off2 &&
+                                            size2.uge(size)),
+                             // maintains same dereferenceability before/after
+                             off == off2 && size2.uge(size)));
 }
 
 expr Pointer::refined(const Pointer &other) const {
@@ -720,23 +812,38 @@ expr Pointer::refined(const Pointer &other) const {
   auto [p2l, d2] = other.toLogicalLocal();
 
   // This refers to a block that was malloc'ed within the function
-  expr local = d2 && p2l.isLocal();
+  expr local = d2 && p2l.isLocal(false);
   local &= p1l.getAllocType() == p2l.getAllocType();
-  local &= p1l.blockSize() == p2l.blockSize();
-  local &= p1l.getOffset() == p2l.getOffset();
+  if (is_asm) {
+    local &= at_least_same_offseting(p1l, p2l, true);
+  } else {
+    local &= p1l.blockSize() == p2l.blockSize();
+    local &= p1l.getOffset() == p2l.getOffset();
+  }
   local &= p1l.isBlockAlive().implies(p2l.isBlockAlive());
   // Attributes are ignored at refinement.
 
-  if (is_asm)
+  if (!is_asm)
     local &= isLogical() == other.isLogical();
 
   // TODO: this induces an infinite loop
   //local &= block_refined(other);
 
   expr nonlocal = is_asm ? getAddress() == other.getAddress() : *this == other;
+  expr is_local = d1 && p1l.isLocal(false);
+
+  // short-circuit to avoid the constraint below:
+  // addr == 0 ? addr' == 0 : addr == addr'
+  if (is_asm && is_local.isFalse())
+    return nonlocal;
 
   return expr::mkIf(isNull(), other.isNull(),
-                    expr::mkIf(d1 && p1l.isLocal(), local, nonlocal));
+                    // allow log(0, offset) -> phy(offset) refinement
+                    // This may increases provenance, so it's a sound refinement
+                    expr::mkIf(isLogical() && !other.isLogical() && !is_asm &&
+                                 getBid() == 0,
+                               getAddress() == other.getAddress(),
+                               expr::mkIf(is_local, local, nonlocal)));
 }
 
 expr Pointer::fninputRefined(const Pointer &other, set<expr> &undef,
@@ -744,30 +851,13 @@ expr Pointer::fninputRefined(const Pointer &other, set<expr> &undef,
   bool is_asm = other.m.isAsmMode();
   auto [p1l, d1] = toLogicalLocal();
   auto [p2l, d2] = other.toLogicalLocal();
-  expr size = p1l.blockSizeOffsetT();
-  expr off = p1l.getOffsetSizet();
-  expr size2 = p2l.blockSizeOffsetT();
-  expr off2 = p2l.getOffsetSizet();
 
   // TODO: check block value for byval_bytes
   if (!byval_bytes.isZero())
     return true;
 
-  expr local
-    = expr::mkIf(p1l.isHeapAllocated(),
-                 p1l.getAllocType() == p2l.getAllocType() &&
-                   off == off2 && size == size2,
-
-                 expr::mkIf(off.sge(0),
-                            off2.sge(0) &&
-                              expr::mkIf(off.ule(size),
-                                         off2.ule(size2) && off2.uge(off) &&
-                                           (size2 - off2).uge(size - off),
-                                         off2.ugt(size2) && off == off2 &&
-                                           size2.uge(size)),
-                            // maintains same dereferenceability before/after
-                            off == off2 && size2.uge(size)));
-  local = d2 && (p2l.isLocal() || p2l.isByval()) && local;
+  expr local = d2 && (p2l.isLocal() || p2l.isByval()) &&
+               at_least_same_offseting(p1l, p2l, false);
 
   if (is_asm)
     local &= isLogical() == other.isLogical();
@@ -876,7 +966,7 @@ pair<Pointer, expr> Pointer::findLogicalLocalPointer(const expr &addr) const {
 
   for (unsigned i = 0, e = m.numLocals(); i != e; ++i) {
     // address not observed; can't alias with that
-    if (!m.observed_addrs.mayAlias(true, i))
+    if (!m.escaped_local_blks.mayAlias(true, i))
       continue;
 
     Pointer p(m, i, true);

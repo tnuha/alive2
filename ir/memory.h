@@ -4,6 +4,7 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 #include "ir/attrs.h"
+#include "ir/functions.h"
 #include "ir/pointer.h"
 #include "ir/state_value.h"
 #include "ir/type.h"
@@ -25,6 +26,7 @@ namespace IR {
 class Memory;
 class SMTMemoryAccess;
 class State;
+struct TypedByte;
 
 
 // A data structure that represents a byte.
@@ -82,8 +84,6 @@ public:
 
   smt::expr&& operator()() && { return std::move(p); }
 
-  smt::expr refined(const Byte &other) const;
-
   smt::expr operator==(const Byte &rhs) const {
     return p == rhs.p;
   }
@@ -96,6 +96,36 @@ public:
 
   friend std::ostream& operator<<(std::ostream &os, const Byte &byte);
   friend class Memory;
+};
+
+
+enum DataType {
+  DATA_NONE = 0,
+  DATA_INT = 1,
+  DATA_PTR = 2,
+  DATA_ANY = DATA_INT | DATA_PTR
+};
+
+struct TypedByte {
+  Byte byte;
+  DataType type;
+
+  bool isAsmMode() const { return byte.isAsmMode(); }
+  smt::expr isPtr() const;
+  smt::expr forceCastToInt() const;
+  smt::expr nonPoison() const;
+  smt::expr isPoison() const;
+  smt::expr nonptrNonpoison() const { return byte.nonptrNonpoison(); }
+  smt::expr boolNonptrNonpoison() const { return byte.boolNonptrNonpoison(); }
+  smt::expr ptrNonpoison() const { return byte.ptrNonpoison(); }
+  Pointer ptr() const { return byte.ptr(); }
+  smt::expr nonptrValue() const { return byte.nonptrValue(); }
+  smt::expr castPtrToInt() const { return byte.castPtrToInt(); }
+  smt::expr ptrValue() const { return byte.ptrValue(); }
+  smt::expr ptrByteoffset() const { return byte.ptrByteoffset(); }
+  smt::expr numStoredBits() const { return byte.numStoredBits(); }
+  smt::expr byteNumber() const { return byte.byteNumber(); }
+  smt::expr refined(const TypedByte &other) const;
 };
 
 
@@ -131,15 +161,12 @@ class Memory {
     void print(std::ostream &os) const;
   };
 
-  enum DataType { DATA_NONE = 0, DATA_INT = 1, DATA_PTR = 2,
-                  DATA_ANY = DATA_INT | DATA_PTR };
-
   struct MemBlock {
     smt::expr val; // array: short offset -> Byte
     std::set<smt::expr> undef;
     unsigned char type = DATA_ANY;
 
-    MemBlock() {}
+    MemBlock() = default;
     MemBlock(smt::expr &&val) : val(std::move(val)) {}
     MemBlock(smt::expr &&val, DataType type)
       : val(std::move(val)), type(type) {}
@@ -152,6 +179,16 @@ class Memory {
 
   smt::expr non_local_block_liveness; // BV w/ 1 bit per bid (1 if live)
   smt::expr local_block_liveness;
+
+  // TODO: change from short idx to arg number
+  smt::expr has_stored_arg; // (short idx, short offset) -> bool
+
+  // record which pointers have been stored to non-local ptrs
+  // bid -> offset*, is_set_incomplete
+  // when used with a lambda, is_set_incomplete becomes true
+  std::vector<std::pair<std::set<smt::expr>, bool>> stored_pointers;
+
+  void record_stored_pointer(uint64_t bid, const smt::expr &offset);
 
   smt::FunctionExpr local_blk_addr; // bid -> (bits_size_t - 1)
   smt::FunctionExpr local_blk_size;
@@ -166,8 +203,7 @@ class Memory {
   AliasSet escaped_local_blks;
   AliasSet observed_addrs;
 
-  void escape_helper(const smt::expr &ptr, AliasSet &set1,
-                     AliasSet *set2 = nullptr);
+  void escape_helper(const smt::expr &ptr, bool escapes);
 
   bool hasEscapedLocals() const {
     return escaped_local_blks.numMayAlias(true) > 0;
@@ -176,6 +212,7 @@ class Memory {
   std::map<smt::expr, AliasSet> ptr_alias; // blockid -> alias
   unsigned next_nonlocal_bid = 0;
   unsigned nextNonlocalBid();
+  unsigned numCurrentNonLocals() const;
 
   static bool observesAddresses();
   static int isInitialMemBlock(const smt::expr &e, bool match_any_init);
@@ -186,25 +223,25 @@ class Memory {
 
   smt::expr isBlockAlive(const smt::expr &bid, bool local) const;
 
-  void mkNonPoisonAxioms(bool local) const;
-  smt::expr mkSubByteZExtStoreCond(const Byte &val, const Byte &val2) const;
-  void mkNonlocalValAxioms(bool skip_consts) const;
+  smt::expr mkSubByteZExtStoreCond(const TypedByte &val,
+                                   const TypedByte &val2) const;
+  void mkNonlocalValAxioms(const smt::expr &block) const;
 
-  bool mayalias(bool local, unsigned bid, const smt::expr &offset,
-                const smt::expr &bytes, uint64_t align, bool write) const;
+  bool mayalias(const Pointer &p, bool local, unsigned bid,
+                const smt::expr &offset, const smt::expr &bytes, uint64_t align,
+                bool write) const;
 
   AliasSet computeAliasing(const Pointer &ptr, const smt::expr &bytes,
                            uint64_t align, bool write) const;
 
   void access(const Pointer &ptr, const smt::expr &bytes, uint64_t align,
               bool write,
-              const std::function<void(MemBlock&, const Pointer&,
-                                       smt::expr&&)> &fn);
+              const std::function<void(MemBlock&, const Pointer&, unsigned,
+                                       bool, smt::expr&&)> &fn);
 
-  std::vector<Byte> load(const Pointer &ptr, unsigned bytes,
-                         std::set<smt::expr> &undef, uint64_t align,
-                         bool left2right = true,
-                         DataType type = DATA_ANY);
+  std::vector<TypedByte> load(const Pointer &ptr, unsigned bytes,
+                              std::set<smt::expr> &undef, uint64_t align,
+                              bool left2right = true);
   StateValue load(const Pointer &ptr, const Type &type,
                   std::set<smt::expr> &undef, uint64_t align);
 
@@ -213,20 +250,25 @@ class Memory {
 
   void store(const Pointer &ptr,
              const std::vector<std::pair<unsigned, smt::expr>> &data,
-             const std::set<smt::expr> &undef, uint64_t align);
+             const std::set<smt::expr> &undef, uint64_t align,
+             DataType orig_type = DATA_ANY);
   void store(const StateValue &val, const Type &type, unsigned offset,
              std::vector<std::pair<unsigned, smt::expr>> &data);
 
   void storeLambda(const Pointer &ptr, const smt::expr &offset,
                    const smt::expr &bytes,
                    const std::vector<std::pair<unsigned, smt::expr>> &data,
-                   const std::set<smt::expr> &undef, uint64_t align);
+                   const std::set<smt::expr> &undef, uint64_t align,
+                   bool full_write = false, DataType orig_type = DATA_ANY);
 
-  smt::expr blockValRefined(const Memory &other, unsigned bid, bool local,
-                            const smt::expr &offset,
-                            std::set<smt::expr> &undef) const;
-  smt::expr blockRefined(const Pointer &src, const Pointer &tgt, unsigned bid,
-                         std::set<smt::expr> &undef) const;
+  // to implement the 'initializes' parameter attribute
+  smt::expr hasStored(const Pointer &p, const smt::expr &bytes) const;
+  void record_store(const Pointer &p, const smt::expr &bytes);
+
+  smt::expr blockRefined(const Pointer &src, const Pointer &tgt) const;
+  smt::expr blockValRefined(const Pointer &src, const Memory &tgt,
+                            unsigned bid, std::set<smt::expr> &undef,
+                            bool full_check) const;
 
   void mkLocalDisjAddrAxioms(const smt::expr &allocated,
                              const smt::expr &short_bid,
@@ -243,6 +285,7 @@ public:
   // TODO: missing local_* equivalents
   class CallState {
     std::vector<smt::expr> non_local_block_val;
+    std::vector<smt::expr> non_local_sizes;
     smt::expr non_local_liveness;
     smt::expr writes_block;
     smt::expr writes_args;
@@ -273,25 +316,6 @@ public:
   smt::expr mkInput(const char *name, const ParamAttrs &attrs);
   std::pair<smt::expr, smt::expr> mkUndefInput(const ParamAttrs &attrs);
 
-  struct PtrInput {
-    unsigned idx;
-    StateValue val;
-    smt::expr byval;
-    smt::expr noread;
-    smt::expr nowrite;
-    smt::expr nocapture;
-
-    PtrInput(unsigned idx, StateValue &&val, smt::expr &&byval,
-             smt::expr &&noread, smt::expr &&nowrite, smt::expr &&nocapture) :
-      idx(idx), val(std::move(val)), byval(std::move(byval)),
-      noread(std::move(noread)), nowrite(std::move(nowrite)),
-      nocapture(std::move(nocapture)) {}
-
-    smt::expr implies(const PtrInput &rhs) const;
-    smt::expr implies_attrs(const PtrInput &rhs) const;
-    auto operator<=>(const PtrInput &rhs) const = default;
-  };
-
   struct FnRetData {
     smt::expr size;
     smt::expr align;
@@ -321,14 +345,18 @@ public:
   std::pair<smt::expr, smt::expr> alloc(const smt::expr *size, uint64_t align,
       BlockKind blockKind, const smt::expr &precond = true,
       const smt::expr &nonnull = false,
-      std::optional<unsigned> bid = std::nullopt, unsigned *bid_out = nullptr);
+      std::optional<unsigned> bid = std::nullopt, unsigned *bid_out = nullptr,
+      bool is_function = false);
 
   // Start lifetime of a local block.
-  void startLifetime(const smt::expr &ptr_local);
+  void startLifetime(const StateValue &ptr);
+
+  // Constrain freeze pointer to currently used blocks for POR optimization
+  void constrainFreezePointer(const Pointer &ptr);
 
   // If unconstrained is true, the pointer offset, liveness, and block kind
   // are not checked.
-  void free(const smt::expr &ptr, bool unconstrained);
+  void free(const StateValue &ptr, bool unconstrained);
 
   static unsigned getStoreByteSize(const Type &ty);
   void store(const smt::expr &ptr, const StateValue &val, const Type &type,
@@ -337,12 +365,13 @@ public:
     load(const smt::expr &ptr, const Type &type, uint64_t align);
 
   // raw load; NB: no UB check
-  Byte raw_load(const Pointer &p, std::set<smt::expr> &undef_vars);
-  Byte raw_load(const Pointer &p);
+  TypedByte raw_load(const Pointer &p, std::set<smt::expr> &undef_vars);
+  TypedByte raw_load(const Pointer &p);
 
   void memset(const smt::expr &ptr, const StateValue &val,
               const smt::expr &bytesize, uint64_t align,
-              const std::set<smt::expr> &undef_vars, bool deref_check = true);
+              const std::set<smt::expr> &undef_vars, bool deref_check = true,
+              bool full_write = false);
 
   void memset_pattern(const smt::expr &ptr, const smt::expr &pattern,
                       const smt::expr &bytesize, unsigned pattern_length);
@@ -354,20 +383,20 @@ public:
   // full copy of memory blocks
   void copy(const Pointer &src, const Pointer &dst);
 
-  void fillPoison(const smt::expr &bid);
-
-  smt::expr ptr2int(const smt::expr &ptr);
-  smt::expr int2ptr(const smt::expr &val) const;
+  smt::expr ptr2int(const smt::expr &ptr, bool escape = true);
+  smt::expr int2ptr(const smt::expr &val);
 
   std::tuple<smt::expr, Pointer, std::set<smt::expr>>
     refined(const Memory &other, bool fncall,
             const std::vector<PtrInput> *set_ptrs = nullptr,
             const std::vector<PtrInput> *set_ptrs_other = nullptr) const;
 
-  // Returns true if a nocapture pointer byte is not in the memory.
-  smt::expr checkNocapture() const;
   void escapeLocalPtr(const smt::expr &ptr, const smt::expr &is_ptr);
-  void observesAddr(const Pointer &ptr);
+  void observesAddr(const Pointer &ptr, bool escapes);
+
+  smt::expr returnChecks() const;
+  smt::expr checkNocapture() const;
+  smt::expr checkInitializes() const;
 
   static Memory mkIf(const smt::expr &cond, Memory &&then, Memory &&els);
 
@@ -386,8 +415,9 @@ public:
   friend class Pointer;
 
 private:
+  static unsigned bitsAlignmentInfo();
   smt::expr mk_block_val_array(unsigned bid) const;
-  Byte raw_load(bool local, unsigned bid, const smt::expr &offset) const;
+  TypedByte raw_load(bool local, unsigned bid, const smt::expr &offset) const;
   void print_array(std::ostream &os, const smt::expr &a,
                    unsigned indent = 0) const;
 };

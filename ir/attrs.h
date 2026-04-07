@@ -3,6 +3,7 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
+#include "ir/functions.h"
 #include "smt/exprs.h"
 #include <optional>
 #include <ostream>
@@ -11,6 +12,7 @@
 
 namespace IR {
 
+class Instr;
 class ParamAttrs;
 class State;
 struct StateValue;
@@ -68,7 +70,7 @@ public:
                    AllocPtr = 1<<11, AllocAlign = 1<<12,
                    ZeroExt = 1<<13, SignExt = 1<<14, InReg = 1<<15,
                    NoFPClass = 1<<16, DeadOnUnwind = 1<<17,
-                   Writable = 1<<18,
+                   Writable = 1<<18, DeadOnReturn = 1<<19,
                    IsArg = 1<<31 // used internally to make values as arguments
                   };
 
@@ -79,6 +81,9 @@ public:
   uint64_t blockSize = 0;        // exact block size for e.g. byval args
   uint64_t align = 1;
   uint16_t nofpclass = 0;
+  std::optional<uint64_t> deadOnReturnBytes; // bytes for dead_on_return, if exist
+
+  std::vector<std::pair<uint64_t, uint64_t>> initializes;
 
   bool has(Attribute a) const { return (bits & a) != 0; }
   void set(Attribute a) { bits |= (unsigned)a; }
@@ -122,7 +127,6 @@ class FnAttrs final {
   std::optional<FPDenormalAttrs> fp_denormal32;
   unsigned bits;
   uint8_t allockind = 0;
-  bool is_tailcall = false;
 
 public:
   enum Attribute { None = 0, NNaN = 1 << 0, NoReturn = 1 << 1,
@@ -155,8 +159,6 @@ public:
   void add(AllocKind k) { allockind |= (uint8_t)k; }
   bool has(AllocKind k) const { return allockind & (uint8_t)k; }
   bool isAlloc() const { return allockind != 0 || has(AllocSize); }
-  void setTailCallSite(bool is_tc) { is_tailcall = is_tc; }
-  bool isTailCall() const { return is_tailcall; }
 
   void inferImpliedAttributes();
 
@@ -218,5 +220,15 @@ struct FpExceptionMode final {
 };
 
 smt::expr isfpclass(const smt::expr &v, const Type &ty, uint16_t mask);
+
+
+struct TailCallInfo final {
+  enum TailCallType { None, Tail, MustTail } type = None;
+  // Determine if callee and caller have the same calling convention.
+  bool has_same_calling_convention = true;
+
+  void check(State &s, const Instr &i, const std::vector<PtrInput> &args) const;
+  friend std::ostream& operator<<(std::ostream &os, const TailCallInfo &tci);
+};
 
 }

@@ -69,7 +69,7 @@ public:
   struct ValTy {
     StateValue val;
     smt::expr return_domain;
-    smt::expr domain;
+    smt::AndExpr domain;
     std::set<smt::expr> undef_vars;
   };
 
@@ -87,25 +87,31 @@ private:
   struct ValueAnalysis {
     std::set<const Value *> non_poison_vals; // vars that are not poison
     // vars that are not undef (partially undefs are not allowed too)
-    std::map<const Value *, smt::expr> non_undef_vals;
+    std::unordered_map<const Value *, smt::expr> non_undef_vals;
     // vars that have never been used
-    std::set<const Value *> unused_vars;
+    std::unordered_set<const Value *> unused_vars;
 
     // Possible number of calls per function name that occurred so far
     // This is an over-approximation, union over all predecessors
     struct FnCallRanges
-      : public std::map<std::string, std::pair<std::set<unsigned>,
-                        SMTMemoryAccess>> {
+      : public std::map<std::string,
+                        // number of calls & whether it can write
+                        std::pair<std::set<std::pair<unsigned, bool>>,
+                                  SMTMemoryAccess>> {
       void inc(const std::string &name, const SMTMemoryAccess &access);
       bool overlaps(const std::string &callee,
                     const SMTMemoryAccess &call_access,
                     const FnCallRanges &other) const;
+      bool isLargerThanInclReads(const FnCallRanges &other) const;
       // remove all ranges but name
       FnCallRanges project(const std::string &name) const;
+      void keep_only_writes();
+      void meet_with(const FnCallRanges &other);
     };
     FnCallRanges ranges_fn_calls;
 
     void meet_with(const ValueAnalysis &other);
+    void clear_smt();
   };
 
   struct VarArgsEntry {
@@ -134,7 +140,7 @@ private:
 
   struct BasicBlockInfo {
     smt::OrExpr path;
-    smt::DisjointExpr<smt::expr> UB, guardUB;
+    smt::DisjointExpr<smt::AndExpr> UB;
     smt::DisjointExpr<Memory> mem;
     std::set<smt::expr> undef_vars;
     ValueAnalysis analysis;
@@ -148,10 +154,14 @@ private:
   smt::AndExpr precondition;
   smt::AndExpr axioms;
 
+  State *src_state = nullptr;
+  std::map<smt::expr, std::vector<const BasicBlock*>> src_bb_paths;
+
   // for -disallow-ub-exploitation
   smt::OrExpr unreachable_paths;
 
-  std::set<std::pair<std::string,std::optional<smt::expr>>> used_approximations;
+  std::set<std::tuple<std::string, std::optional<smt::expr>, bool>>
+    used_approximations;
 
   std::set<smt::expr> quantified_vars;
   std::set<smt::expr> nondet_vars;
@@ -183,6 +193,9 @@ private:
   unsigned i_tmp_values = 0; // next available position in tmp_values
 
   void check_enough_tmp_slots();
+  void copyUBFrom(const BasicBlock &bb);
+  void copyUBFromBB(
+    const std::unordered_map<const BasicBlock*, BasicBlockInfo> &tgt_data);
 
   // return_domain: a boolean expression describing return condition
   smt::OrExpr return_domain;
@@ -195,17 +208,17 @@ private:
 
   struct FnCallInput {
     std::vector<StateValue> args_nonptr;
-    std::vector<Memory::PtrInput> args_ptr;
+    std::vector<PtrInput> args_ptr;
     ValueAnalysis::FnCallRanges fncall_ranges;
     Memory m;
     SMTMemoryAccess memaccess;
     bool noret, willret;
 
-    smt::expr implies(const FnCallInput &rhs) const;
+    smt::expr refines(const FnCallInput &rhs) const;
     smt::expr refinedBy(State &s, const std::string &callee,
                         unsigned inaccessible_bid,
                         const std::vector<StateValue> &args_nonptr,
-                        const std::vector<Memory::PtrInput> &args_ptr,
+                        const std::vector<PtrInput> &args_ptr,
                         const ValueAnalysis::FnCallRanges &fncall_ranges,
                         const Memory &m, const SMTMemoryAccess &memaccess,
                         bool noret, bool willret) const;
@@ -224,7 +237,7 @@ private:
 
     static FnCallOutput mkIf(const smt::expr &cond, const FnCallOutput &then,
                              const FnCallOutput &els);
-    smt::expr implies(const FnCallOutput &rhs, const Type &retval_ty) const;
+    smt::expr refines(const FnCallOutput &rhs, const Type &retval_ty) const;
     auto operator<=>(const FnCallOutput &rhs) const = default;
   };
   std::map<std::string, std::map<FnCallInput, FnCallOutput>> fn_call_data;
@@ -254,6 +267,7 @@ public:
   }
   const StateValue& getVal(const Value &val, bool is_poison_ub);
   const smt::expr& getWellDefinedPtr(const Value &val);
+  StateValue freeze(const Type &type, const StateValue &val);
 
   const ValTy* at(const Value &val) const;
   bool isUndef(const smt::expr &e) const;
@@ -278,9 +292,9 @@ public:
   void addReturn(StateValue &&val);
 
   /*--- Axioms, preconditions, domains ---*/
-  void addAxiom(smt::AndExpr &&ands) { axioms.add(std::move(ands)); }
-  void addAxiom(smt::expr &&axiom) { axioms.add(std::move(axiom)); }
-  void addPre(smt::expr &&cond) { precondition.add(std::move(cond)); }
+  void addAxiom(smt::AndExpr &&ands);
+  void addAxiom(smt::expr &&axiom);
+  void addPre(smt::expr &&cond, bool quantify_undefs = true);
 
   // we have 2 types of UB to support -disallow-ub-exploitation
   // 1) UB that cannot be safeguarded, and 2) UB that can be safeguarded
@@ -296,7 +310,7 @@ public:
 
   StateValue
     addFnCall(const std::string &name, std::vector<StateValue> &&inputs,
-              std::vector<Memory::PtrInput> &&ptr_inputs,
+              std::vector<PtrInput> &&ptr_inputs,
               const Type &out_type,
               StateValue &&ret_arg, const Type *ret_arg_ty,
               std::vector<StateValue> &&ret_args, const FnAttrs &attrs,
@@ -304,7 +318,8 @@ public:
 
   auto& getVarArgsData() { return var_args_data.data; }
 
-  void doesApproximation(std::string &&name, std::optional<smt::expr> e = {});
+  void doesApproximation(std::string &&name, std::optional<smt::expr> e = {},
+                         bool must_be_true = false);
   auto& getApproximations() const { return used_approximations; }
 
   smt::expr getFreshNondetVar(const char *prefix, const smt::expr &type);
@@ -322,6 +337,8 @@ public:
 
   bool isInitializationPhase() const { return is_initialization_phase; }
   void finishInitializer();
+
+  bool isImplied(const smt::expr &e, const smt::expr &domain);
 
   auto& getFn() const { return f; }
   auto& getMemory() const { return memory; }
@@ -363,9 +380,11 @@ public:
   bool hasGlobalVarBid(const std::string &glbvar, unsigned &bid,
                        bool &allocated) const;
   void markGlobalAsAllocated(const std::string &glbvar);
+  bool isGVUsed(unsigned bid) const;
   void syncSEdataWithSrc(State &src);
 
   void mkAxioms(State &tgt);
+  void cleanup();
 
 private:
   smt::expr strip_undef_and_add_ub(const Value &val, const smt::expr &e,

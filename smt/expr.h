@@ -12,13 +12,15 @@
 #include <utility>
 #include <vector>
 
-typedef struct _Z3_context* Z3_context;
-typedef struct _Z3_func_decl* Z3_decl;
-typedef struct _Z3_app* Z3_app;
-typedef struct _Z3_ast* Z3_ast;
-typedef struct _Z3_sort* Z3_sort;
+typedef struct _Z3_context *Z3_context;
+typedef struct _Z3_func_decl *Z3_decl;
+typedef struct _Z3_app *Z3_app;
+typedef struct _Z3_ast *Z3_ast;
+typedef struct _Z3_sort *Z3_sort;
 
 namespace smt {
+
+class AndExpr;
 
 class expr {
   uintptr_t ptr = 0;
@@ -26,7 +28,9 @@ class expr {
   expr(Z3_ast ast) noexcept;
   bool isZ3Ast() const;
   Z3_ast ast() const;
-  Z3_ast operator()() const { return ast(); }
+  Z3_ast operator()() const {
+    return ast();
+  }
   void incRef();
   void decRef();
 
@@ -36,19 +40,20 @@ class expr {
   Z3_app isAppOf(int app_type) const;
 
   expr binop_commutative(const expr &rhs,
-                         Z3_ast(*op)(Z3_context, Z3_ast, Z3_ast),
+                         Z3_ast (*op)(Z3_context, Z3_ast, Z3_ast),
                          expr (expr::*expr_op)(const expr &) const,
                          bool (expr::*identity)() const,
-                         bool (expr::*absorvent)() const,
-                         int z3_app = 0) const;
+                         bool (expr::*absorvent)() const, int z3_app = 0) const;
   expr binop_commutative(const expr &rhs,
-                         Z3_ast(*op)(Z3_context, Z3_ast, Z3_ast)) const;
+                         Z3_ast (*op)(Z3_context, Z3_ast, Z3_ast)) const;
 
-  expr unop_fold(Z3_ast(*op)(Z3_context, Z3_ast)) const;
+  expr unop_fold(Z3_ast (*op)(Z3_context, Z3_ast)) const;
   expr binop_fold(const expr &rhs,
-                  Z3_ast(*op)(Z3_context, Z3_ast, Z3_ast)) const;
+                  Z3_ast (*op)(Z3_context, Z3_ast, Z3_ast)) const;
 
-  bool alwaysFalse() const { return false; }
+  bool alwaysFalse() const {
+    return false;
+  }
 
   static Z3_ast mkTrue();
   static Z3_ast mkFalse();
@@ -87,6 +92,8 @@ public:
   static expr mkQuad(double n);
   static expr mkNaN(const expr &type);
   static expr mkNumber(const char *n, const expr &type);
+  static expr mkQVar(unsigned n, const expr &type);
+  static expr mkQVar(unsigned n, unsigned bits);
   static expr mkVar(const char *name, const expr &type);
   static expr mkVar(const char *name, unsigned bits, bool fresh = false);
   static expr mkBoolVar(const char *name);
@@ -107,10 +114,13 @@ public:
   // structural equivalence
   bool eq(const expr &rhs) const;
 
-  bool isValid() const { return ptr != 0; }
+  bool isValid() const {
+    return ptr != 0;
+  }
 
   bool isConst() const;
   bool isVar() const;
+  bool isQVar() const;
   bool isBV() const;
   bool isBool() const;
   bool isFloat() const;
@@ -135,6 +145,7 @@ public:
   bool isConcat(expr &a, expr &b) const;
   bool isExtract(expr &e, unsigned &high, unsigned &low) const;
   bool isSignExt(expr &val) const;
+  bool isAShr(expr &a, expr &b) const;
   bool isAnd(expr &a, expr &b) const;
   bool isNot(expr &neg) const;
   bool isAdd(expr &a, expr &b) const;
@@ -193,9 +204,11 @@ public:
   static expr fshl(const expr &a, const expr &b, const expr &c);
   static expr fshr(const expr &a, const expr &b, const expr &c);
   static expr smul_fix(const expr &a, const expr &b, const expr &c);
-  static expr smul_fix_no_soverflow(const expr &a, const expr &b, const expr &c);
+  static expr smul_fix_no_soverflow(const expr &a, const expr &b,
+                                    const expr &c);
   static expr umul_fix(const expr &a, const expr &b, const expr &c);
-  static expr umul_fix_no_uoverflow(const expr &a, const expr &b, const expr &c);
+  static expr umul_fix_no_uoverflow(const expr &a, const expr &b,
+                                    const expr &c);
   static expr smul_fix_sat(const expr &a, const expr &b, const expr &c);
   static expr umul_fix_sat(const expr &a, const expr &b, const expr &c);
 
@@ -220,6 +233,8 @@ public:
   expr abs() const;
 
   expr round_up(const expr &power_of_two) const;
+  expr round_up_bits(const expr &nbits) const;
+  expr round_up_bits_no_overflow(const expr &nbits) const;
 
   expr isNaN() const;
   expr isInf() const;
@@ -244,6 +259,7 @@ public:
   expr fneg() const;
   expr copysign(const expr &sign) const;
   expr sqrt(const expr &rm) const;
+  std::pair<expr, expr> frexp() const;
 
   static expr fma(const expr &a, const expr &b, const expr &c, const expr &rm);
 
@@ -283,6 +299,7 @@ public:
   void operator&=(const expr &rhs);
   void operator|=(const expr &rhs);
 
+  static expr mk_and(const std::vector<expr> &vals);
   static expr mk_and(const std::set<expr> &vals);
   static expr mk_or(const std::set<expr> &vals);
 
@@ -299,6 +316,7 @@ public:
   expr sgt(const expr &rhs) const;
 
   expr ule(uint64_t rhs) const;
+  expr ule_extend(uint64_t rhs) const;
   expr ult(uint64_t rhs) const;
   expr uge(uint64_t rhs) const;
   expr ugt(uint64_t rhs) const;
@@ -346,7 +364,9 @@ public:
 
   static expr mkIf(const expr &cond, const expr &then, const expr &els);
   static expr mkForAll(const std::set<expr> &vars, expr &&val);
-  static expr mkLambda(const expr &var, const expr &val);
+  static expr mkForAll(unsigned num_vars, const expr *vars, const char **names,
+                       expr &&val);
+  static expr mkLambda(const expr &var, const char *var_name, const expr &val);
 
   expr simplify() const;
   expr simplifyNoTimeout() const;
@@ -355,13 +375,17 @@ public:
 
   // replace v1 -> v2
   expr subst(const std::vector<std::pair<expr, expr>> &repls) const;
+  expr subst_simplify(const std::vector<std::pair<expr, expr>> &repls) const;
   expr subst(const expr &from, const expr &to) const;
 
-  // replace quantified variables in increasing index order
-  expr subst(const std::vector<expr> &repls) const;
+  // replace the 1st quantified variable
+  expr subst_var(const expr &repl) const;
+
+  // turn all expressions in 'constraints' into true
+  expr propagate(const AndExpr &constraints) const;
 
   std::set<expr> vars() const;
-  static std::set<expr> vars(const std::vector<const expr*> &exprs);
+  static std::set<expr> vars(const std::vector<const expr *> &exprs);
 
   std::set<expr> leafs(unsigned max = 64) const;
 
@@ -370,9 +394,11 @@ public:
   void printUnsigned(std::ostream &os) const;
   void printSigned(std::ostream &os) const;
   void printHexadecimal(std::ostream &os) const;
+  // WARNING: these are temporary strings; don't store them
   void printSort(std::ostream &os) const;
-  std::string numeral_string() const;
-  std::string fn_name() const; // empty if not a function
+  std::string_view numeral_string() const;
+  std::string_view fn_name() const; // empty if not a function
+
   unsigned getFnNumArgs() const;
   expr getFnArg(unsigned i) const;
   friend std::ostream &operator<<(std::ostream &os, const expr &e);
@@ -382,22 +408,26 @@ public:
   unsigned id() const;
   unsigned hash() const;
 
-
   template <typename... Exprs>
-  static bool allValid(const expr &e, Exprs&&... exprs) {
+  static bool allValid(const expr &e, Exprs &&...exprs) {
     return e.isValid() && allValid(exprs...);
   }
-  static bool allValid(const expr &e) { return e.isValid(); }
-  static bool allValid() { return true; }
+  static bool allValid(const expr &e) {
+    return e.isValid();
+  }
+  static bool allValid() {
+    return true;
+  }
 
   friend class Solver;
   friend class FnModel;
   friend class Model;
 };
 
-
-#define mkIf_fold(c, a, b) \
-  mkIf_fold_fn<decltype(a)>(c, [&]() { return a; }, [&]() { return b; })
+#define mkIf_fold(c, a, b)                                                     \
+  mkIf_fold_fn<std::remove_cvref_t<decltype(a)>>(                              \
+      c, [&]() -> decltype(auto) { return a; },                                \
+      [&]() -> decltype(auto) { return b; })
 
 template <typename RetTy, typename T1, typename T2>
 static RetTy mkIf_fold_fn(const expr &cond, T1 &&a, T2 &&b) {
@@ -408,4 +438,4 @@ static RetTy mkIf_fold_fn(const expr &cond, T1 &&a, T2 &&b) {
   return RetTy::mkIf(cond, a(), b());
 }
 
-}
+} // namespace smt
