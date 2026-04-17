@@ -1,9 +1,10 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
-#include "smt/expr.h"
 #include "smt/ctx.h"
+#include "smt/expr.h"
 #include "smt/exprs.h"
+#include "smt/smt.h"
 #include "util/compiler.h"
 #include <algorithm>
 #include <bit>
@@ -2516,10 +2517,6 @@ void expr::printSigned(ostream &os) const {
 void expr::printHexadecimal(ostream &os) const {
   auto rem = bits() % 4;
   os << (rem == 0 ? *this : zext(4 - rem));
-}
-
-void expr::printSort(ostream &os) const {
-  os << Z3_sort_to_string(ctx(), sort());
 }
 
 void expr::printSort(ostream &os) const {
